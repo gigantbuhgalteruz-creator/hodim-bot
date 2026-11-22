@@ -921,7 +921,7 @@ def handle_owner(text):
         send(OWNER, f"✅ {v['day']} dagi qoidabuzarlik bekor qilindi.")
     elif cmd == "/dashboard":
         url = current_url()
-        send(OWNER, f"📈 Dashboard: {url}/dashboard\n(login va parol bilan kiriladi, 1 soatdan keyin o'zi chiqaradi)"
+        send(OWNER, f"📈 Dashboard: {url}/dashboard\n(login va parol bilan kiriladi, 1 soat harakatsiz qolsa o'zi chiqaradi)"
                     f"\n🧩 Hodimlar skripti: {url}/skript.user.js")
     else:
         send(OWNER, "Noma'lum buyruq. /help")
@@ -1079,9 +1079,13 @@ def session_new():
     return t
 
 
-def session_valid(token):
+def session_valid(token, touch=False):
+    """Sessiya tirikmi. touch=True — foydalanuvchi faol: muddat yana SESSION_TTL ga uzayadi
+    (ya'ni 1 soat HARAKATSIZ qolsa chiqariladi)."""
     exp = SESSIONS.get(token or "")
     if exp and exp > time.time():
+        if touch:
+            exp = SESSIONS[token] = time.time() + SESSION_TTL
         return exp
     SESSIONS.pop(token or "", None)
     return None
@@ -1091,7 +1095,7 @@ def session_end(token):
     SESSIONS.pop(token or "", None)
 
 
-LOGIN_MSG = {"bad": "Login yoki parol noto‘g‘ri", "expired": "Sessiya tugadi — qayta kiring",
+LOGIN_MSG = {"bad": "Login yoki parol noto‘g‘ri", "expired": "1 soat harakatsiz qolgani uchun tizimdan chiqarildingiz",
              "out": "Tizimdan chiqdingiz", "blocked": "Juda ko‘p xato urinish. 15 daqiqadan keyin urining"}
 
 
@@ -1130,7 +1134,7 @@ background:var(--acc);color:#fff;box-shadow:0 8px 22px -8px var(--acc)}}
 <label>Login<input name="username" autocomplete="username" required autofocus></label>
 <label>Parol<input name="password" type="password" autocomplete="current-password" required></label>
 <button>Kirish</button>
-<div class="foot">Xavfsizlik uchun sessiya {SESSION_TTL // 60} daqiqadan keyin avtomatik yopiladi</div>
+<div class="foot">Xavfsizlik uchun {SESSION_TTL // 60} daqiqa harakatsiz qolinsa, tizim avtomatik chiqaradi</div>
 </form></body></html>"""
 
 
@@ -1142,7 +1146,7 @@ def status_pill(status, error_reason=None):
             f'<div class="sub">{esc(status or "")}</div>')
 
 
-def render_dashboard(flash="", session_exp=None):
+def render_dashboard(flash=""):
     a, b = week_range()
     d = now().date()
     ma = d.replace(day=1)
@@ -1300,7 +1304,6 @@ padding:10px 13px;border-radius:12px;border:1px solid var(--line);background:var
 <header><h1>Hodimlar samaradorligi</h1>
 <div class="hright"><div class="mut meta glass">Hafta {a:%d.%m} – {b:%d.%m.%Y} · {WORK_START}–{WORK_END} · {now():%H:%M}</div>
 <button class="btn" id="addEmp">+ Hodim qo'shish</button>
-<div class="mut meta glass" title="Sessiya tugashiga qolgan vaqt">⏱ <span id="sessLeft">—</span></div>
 <a class="btn ghost" href="/logout">Chiqish</a></div></header>
 {flash_html}
 <div class="kpis">
@@ -1374,12 +1377,11 @@ document.querySelectorAll('[data-asg]').forEach(b=>b.onclick=()=>{{const d=docum
 d.querySelector('[name=tg_id]').value=b.dataset.id;d.querySelector('.who').textContent=b.dataset.name;d.showModal();
 d.querySelector('textarea').focus();}});
 document.querySelectorAll('[data-close]').forEach(b=>b.onclick=()=>b.closest('dialog').close());
-setInterval(()=>{{if(!document.querySelector('dialog[open]'))location.replace('/dashboard')}},60000);
-const SESS_END={int((session_exp or 0) * 1000)};
-function tickSess(){{const s=Math.max(0,Math.round((SESS_END-Date.now())/1000));
-document.getElementById('sessLeft').textContent=Math.floor(s/60)+':'+String(s%60).padStart(2,'0');
-if(SESS_END&&s<=0)location.replace('/login?e=expired');}}
-tickSess();setInterval(tickSess,1000);
+// Har daqiqa yangilanadi. Oxirgi daqiqada sichqoncha/klaviatura/aylantirish bo'lsa — faol (sessiya uzayadi).
+let lastAct=/[?&]auto=1/.test(location.search)?0:Date.now();
+['mousemove','mousedown','keydown','scroll','touchstart'].forEach(ev=>addEventListener(ev,()=>{{lastAct=Date.now()}},{{passive:true}}));
+setInterval(()=>{{if(document.querySelector('dialog[open]'))return;
+location.replace('/dashboard?auto=1&active='+(Date.now()-lastAct<60000?1:0))}},60000);
 </script></body></html>"""
 
 
@@ -1403,15 +1405,18 @@ class Handler(BaseHTTPRequestHandler):
     def _ip(self):
         return self.headers.get("CF-Connecting-IP") or self.client_address[0]
 
-    def _session(self):
-        """Joriy sessiya tugash vaqti (unix) yoki None."""
+    def _cookie(self):
         c = http.cookies.SimpleCookie()
         try:
             c.load(self.headers.get("Cookie", ""))
         except Exception:
-            return None
+            return ""
         m = c.get(SESSION_COOKIE)
-        return session_valid(m.value if m else "")
+        return m.value if m else ""
+
+    def _session(self, touch=False):
+        """Joriy sessiya tugash vaqti (unix) yoki None."""
+        return session_valid(self._cookie(), touch)
 
     def _go(self, location, cookie=None):
         self.send_response(303)
@@ -1442,10 +1447,11 @@ class Handler(BaseHTTPRequestHandler):
         LOGIN_FAILS.pop(ip, None)
         token = session_new()
         log("LOGIN", ip)
-        self._go("/dashboard", f"{SESSION_COOKIE}={token}; Path=/; Max-Age={SESSION_TTL}; HttpOnly; Secure; SameSite=Strict")
+        # Max-Age yo'q: brauzer yopilsa cookie o'chadi; muddatni server nazorat qiladi
+        self._go("/dashboard", f"{SESSION_COOKIE}={token}; Path=/; HttpOnly; Secure; SameSite=Strict")
 
     def _dashboard_post(self, raw):
-        if not self._session():
+        if not self._session(touch=True):
             return self._go("/login?e=expired")
         fl = urllib.parse.parse_qs(raw.decode("utf-8", "replace"))
         f = {k: v[0] for k, v in fl.items()}
@@ -1552,20 +1558,17 @@ class Handler(BaseHTTPRequestHandler):
                 return self._go("/dashboard")
             return self._out(200, render_login(qs.get("e", [""])[0]), "text/html; charset=utf-8")
         if path == "/logout":
-            c = http.cookies.SimpleCookie()
-            try:
-                c.load(self.headers.get("Cookie", ""))
-            except Exception:
-                pass
-            m = c.get(SESSION_COOKIE)
-            session_end(m.value if m else "")
+            session_end(self._cookie())
             return self._go("/login?e=out", f"{SESSION_COOKIE}=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict")
         if path not in ("/", "/dashboard"):
             return self._out(404, "not found", "text/plain")
-        exp = self._session()
+        # Avto-yangilanish (har daqiqa) faollik hisoblanmaydi — faqat foydalanuvchi sahifada nimadir qilgan bo'lsa.
+        auto = qs.get("auto", [""])[0] == "1"
+        active = qs.get("active", [""])[0] == "1"
+        exp = self._session(touch=(not auto) or active)
         if not exp:
-            return self._go("/login")
-        self._out(200, render_dashboard(qs.get("m", [""])[0], exp), "text/html; charset=utf-8")
+            return self._go("/login?e=expired" if self._cookie() else "/login")
+        self._out(200, render_dashboard(qs.get("m", [""])[0]), "text/html; charset=utf-8")
 
 
 def main():
