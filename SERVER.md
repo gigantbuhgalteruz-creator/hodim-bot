@@ -24,6 +24,11 @@ scp -i %USERPROFILE%\.ssh\hodim_bot_hetzner C:\hodim-bot\bot.py root@165.227.155
 ssh -i %USERPROFILE%\.ssh\hodim_bot_hetzner root@165.227.155.177 "chown hodimbot: /opt/hodim-bot/bot.py && systemctl restart hodim-bot"
 ```
 
+## GitHub (private)
+- Repo: https://github.com/gigantbuhgalteruz-creator/hodim-bot
+- Serverda nusxa: `/root/hodim-bot-repo`, push deploy-kalit bilan (`/root/.ssh/github_hodim_bot`, faqat shu repo).
+- Yangilash: o'zgargan fayllarni `/root/hodim-bot-repo` ga qo'yib, `git add -A && git commit -m "..." && git push`.
+
 ## Eslatma
 - Shu kompyuterdagi lokal bot O'CHIRILGAN. Avtostart yorliqlari `C:\hodim-bot\backup\startup-yorliqlar` ga olindi.
   Ikkala bot bir vaqtda ishlamasin (xabarlar ikki marta keladi).
