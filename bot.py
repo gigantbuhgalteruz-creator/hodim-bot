@@ -7,6 +7,7 @@ Ishga tushirish:  python3 bot.py      (config.json shu papkada bo'lishi kerak)
 """
 import base64
 import html
+import http.cookies
 import json
 import os
 import re
@@ -920,7 +921,8 @@ def handle_owner(text):
         send(OWNER, f"✅ {v['day']} dagi qoidabuzarlik bekor qilindi.")
     elif cmd == "/dashboard":
         url = current_url()
-        send(OWNER, f"📈 Dashboard: {url}/dashboard\n🧩 Hodimlar skripti: {url}/skript.user.js")
+        send(OWNER, f"📈 Dashboard: {url}/dashboard\n(login va parol bilan kiriladi, 1 soatdan keyin o'zi chiqaradi)"
+                    f"\n🧩 Hodimlar skripti: {url}/skript.user.js")
     else:
         send(OWNER, "Noma'lum buyruq. /help")
 
@@ -1059,6 +1061,79 @@ FLASH = {"emp_ok": "✅ Hodim qo'shildi", "emp_nosend": "✅ Hodim qo'shildi, le
          "stale": "⚠️ Sahifa eskirgan edi — yangilandi. Iltimos, qayta kiriting."}
 
 
+# ---- login sessiyalari: har kirish 1 soat amal qiladi, keyin qayta login so'raladi
+SESSION_COOKIE = "hb_session"
+SESSION_TTL = int(CFG.get("SESSION_MINUTES", 60)) * 60
+SESSIONS = {}   # token -> tugash vaqti (unix). Bot qayta yonsa hamma qayta kiradi.
+SECURITY_HEADERS = {"X-Frame-Options": "DENY", "X-Content-Type-Options": "nosniff",
+                    "Referrer-Policy": "no-referrer", "Cache-Control": "no-store"}
+
+
+def session_new():
+    t = secrets.token_urlsafe(32)
+    with LOCK:
+        now_ts = time.time()
+        for k in [k for k, v in SESSIONS.items() if v < now_ts]:
+            SESSIONS.pop(k, None)
+        SESSIONS[t] = now_ts + SESSION_TTL
+    return t
+
+
+def session_valid(token):
+    exp = SESSIONS.get(token or "")
+    if exp and exp > time.time():
+        return exp
+    SESSIONS.pop(token or "", None)
+    return None
+
+
+def session_end(token):
+    SESSIONS.pop(token or "", None)
+
+
+LOGIN_MSG = {"bad": "Login yoki parol noto‘g‘ri", "expired": "Sessiya tugadi — qayta kiring",
+             "out": "Tizimdan chiqdingiz", "blocked": "Juda ko‘p xato urinish. 15 daqiqadan keyin urining"}
+
+
+def render_login(err=""):
+    msg = LOGIN_MSG.get(err, "")
+    cls = "ok" if err == "out" else "err"
+    return f"""<!DOCTYPE html><html lang="uz"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Kirish · Hodimlar</title><style>
+:root{{--ink:#2b1a0f;--mut:#97755e;--acc:#f97316;--acc-soft:rgba(249,115,22,.14);--glass:rgba(255,255,255,.55);
+--edge:rgba(255,255,255,.85);--line:rgba(194,65,12,.14);--field:rgba(255,255,255,.75);--shadow:rgba(194,65,12,.16);
+--bg1:#fff8f1;--bg2:#ffe9d6;--b1:rgba(251,146,60,.55);--b2:rgba(253,186,116,.6);--r:#b91c1c;--r-bg:rgba(239,68,68,.12);--g:#15803d;--g-bg:rgba(34,197,94,.14)}}
+@media (prefers-color-scheme:dark){{:root{{--ink:#fbeee4;--mut:#c19c84;--acc:#fb923c;--glass:rgba(48,28,16,.55);
+--edge:rgba(255,255,255,.1);--field:rgba(0,0,0,.25);--shadow:rgba(0,0,0,.4);--bg1:#160c06;--bg2:#24130a;
+--b1:rgba(234,88,12,.4);--b2:rgba(251,146,60,.22);--r:#fca5a5;--g:#4ade80}}}}
+*{{box-sizing:border-box}}
+body{{margin:0;min-height:100vh;display:grid;place-items:center;padding:16px;font:14px/1.5 "Segoe UI",system-ui,sans-serif;color:var(--ink);
+background:radial-gradient(800px 500px at 10% -10%,var(--b1),transparent 60%),radial-gradient(700px 480px at 110% 110%,var(--b2),transparent 60%),
+linear-gradient(170deg,var(--bg1),var(--bg2));background-attachment:fixed}}
+.card{{width:min(380px,100%);padding:32px 28px;border-radius:26px;background:var(--glass);border:1px solid var(--edge);
+backdrop-filter:blur(24px) saturate(170%);-webkit-backdrop-filter:blur(24px) saturate(170%);box-shadow:0 24px 70px -24px var(--shadow)}}
+h1{{font-size:22px;font-weight:600;margin:0 0 4px;display:flex;align-items:center;gap:12px}}
+h1:before{{content:"";width:12px;height:12px;border-radius:50%;background:var(--acc);box-shadow:0 0 0 6px var(--acc-soft)}}
+p{{margin:0 0 22px;color:var(--mut)}}
+label{{display:block;font-size:12px;font-weight:600;color:var(--mut);margin-bottom:14px}}
+input{{display:block;width:100%;margin-top:6px;font:inherit;font-size:15px;color:var(--ink);padding:11px 14px;border-radius:12px;
+border:1px solid var(--line);background:var(--field);outline:none}}
+input:focus{{border-color:var(--acc);box-shadow:0 0 0 3px var(--acc-soft)}}
+button{{width:100%;margin-top:8px;font:inherit;font-weight:600;font-size:15px;border:0;border-radius:999px;padding:12px;cursor:pointer;
+background:var(--acc);color:#fff;box-shadow:0 8px 22px -8px var(--acc)}}
+.msg{{padding:10px 14px;border-radius:12px;font-weight:600;font-size:13px;margin-bottom:16px}}
+.msg.err{{background:var(--r-bg);color:var(--r)}}.msg.ok{{background:var(--g-bg);color:var(--g)}}
+.foot{{text-align:center;font-size:12px;color:var(--mut);margin-top:18px}}
+</style></head><body><form class="card" method="post" action="/login" autocomplete="on">
+<h1>Hodimlar dashboardi</h1><p>Davom etish uchun tizimga kiring</p>
+{f'<div class="msg {cls}">{esc(msg)}</div>' if msg else ''}
+<label>Login<input name="username" autocomplete="username" required autofocus></label>
+<label>Parol<input name="password" type="password" autocomplete="current-password" required></label>
+<button>Kirish</button>
+<div class="foot">Xavfsizlik uchun sessiya {SESSION_TTL // 60} daqiqadan keyin avtomatik yopiladi</div>
+</form></body></html>"""
+
+
 def status_pill(status, error_reason=None):
     level, label = status_level(status, error_reason)
     cls = {"good": "g", "bad": "r"}.get(level, "y")
@@ -1067,7 +1142,7 @@ def status_pill(status, error_reason=None):
             f'<div class="sub">{esc(status or "")}</div>')
 
 
-def render_dashboard(flash=""):
+def render_dashboard(flash="", session_exp=None):
     a, b = week_range()
     d = now().date()
     ma = d.replace(day=1)
@@ -1188,6 +1263,7 @@ tr:last-child td{{border-bottom:0}}tbody tr:hover td,tr:hover td{{background:var
 background:var(--acc);color:#fff;box-shadow:0 6px 18px -6px var(--acc);transition:transform .12s,filter .12s}}
 .btn:hover{{filter:brightness(1.06);transform:translateY(-1px)}}
 .btn.ghost{{background:var(--acc-soft);color:var(--acc);box-shadow:none}}
+a.btn{{text-decoration:none;display:inline-block}}
 .team{{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(330px,100%),1fr));gap:14px}}
 .member{{padding:18px 20px}}.mhead{{display:flex;justify-content:space-between;align-items:flex-start;gap:12px}}
 .chips{{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px}}
@@ -1223,7 +1299,9 @@ padding:10px 13px;border-radius:12px;border:1px solid var(--line);background:var
 </style></head><body><div class="wrap">
 <header><h1>Hodimlar samaradorligi</h1>
 <div class="hright"><div class="mut meta glass">Hafta {a:%d.%m} – {b:%d.%m.%Y} · {WORK_START}–{WORK_END} · {now():%H:%M}</div>
-<button class="btn" id="addEmp">+ Hodim qo'shish</button></div></header>
+<button class="btn" id="addEmp">+ Hodim qo'shish</button>
+<div class="mut meta glass" title="Sessiya tugashiga qolgan vaqt">⏱ <span id="sessLeft">—</span></div>
+<a class="btn ghost" href="/logout">Chiqish</a></div></header>
 {flash_html}
 <div class="kpis">
 <div class="kpi glass"><span class="mut">Hodimlar</span><b>{total}</b></div>
@@ -1297,6 +1375,11 @@ d.querySelector('[name=tg_id]').value=b.dataset.id;d.querySelector('.who').textC
 d.querySelector('textarea').focus();}});
 document.querySelectorAll('[data-close]').forEach(b=>b.onclick=()=>b.closest('dialog').close());
 setInterval(()=>{{if(!document.querySelector('dialog[open]'))location.replace('/dashboard')}},60000);
+const SESS_END={int((session_exp or 0) * 1000)};
+function tickSess(){{const s=Math.max(0,Math.round((SESS_END-Date.now())/1000));
+document.getElementById('sessLeft').textContent=Math.floor(s/60)+':'+String(s%60).padStart(2,'0');
+if(SESS_END&&s<=0)location.replace('/login?e=expired');}}
+tickSess();setInterval(tickSess,1000);
 </script></body></html>"""
 
 
@@ -1309,46 +1392,61 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
+        if ctype.startswith("text/html"):
+            for k, v in SECURITY_HEADERS.items():
+                self.send_header(k, v)
         for k, v in (extra or {}).items():
             self.send_header(k, v)
         self.end_headers()
         self.wfile.write(data)
 
-    def _auth(self):
-        """Dashboard paroli. True — davom etamiz; False — javob allaqachon yuborilgan."""
-        ip = self.headers.get("CF-Connecting-IP") or self.client_address[0]
-        t = time.time()
-        fails = [x for x in LOGIN_FAILS.get(ip, []) if x > t - FAIL_WINDOW]
-        if len(fails) >= MAX_FAILS:
-            self._out(429, "Juda ko'p noto'g'ri urinish. 15 daqiqadan keyin qayta urining.",
-                      "text/plain; charset=utf-8")
-            return False
-        auth = self.headers.get("Authorization", "")
-        ok = False
-        if auth.startswith("Basic ") and DASH_PASSWORD:
-            try:
-                user, pw = base64.b64decode(auth[6:]).decode().split(":", 1)
-                ok = secrets.compare_digest(pw, DASH_PASSWORD) and (
-                    not DASH_USER or secrets.compare_digest(user, DASH_USER))
-            except Exception:
-                ok = False
-            if not ok:
-                fails.append(t)
-        LOGIN_FAILS[ip] = fails
-        if not ok:
-            self._out(401, "Parol kerak", "text/plain; charset=utf-8",
-                      {"WWW-Authenticate": 'Basic realm="dashboard"'})
-        return ok
+    def _ip(self):
+        return self.headers.get("CF-Connecting-IP") or self.client_address[0]
 
-    def _redirect(self, flash):
+    def _session(self):
+        """Joriy sessiya tugash vaqti (unix) yoki None."""
+        c = http.cookies.SimpleCookie()
+        try:
+            c.load(self.headers.get("Cookie", ""))
+        except Exception:
+            return None
+        m = c.get(SESSION_COOKIE)
+        return session_valid(m.value if m else "")
+
+    def _go(self, location, cookie=None):
         self.send_response(303)
-        self.send_header("Location", "/dashboard?m=" + flash)
+        self.send_header("Location", location)
         self.send_header("Content-Length", "0")
+        self.send_header("Cache-Control", "no-store")
+        if cookie:
+            self.send_header("Set-Cookie", cookie)
         self.end_headers()
 
+    def _redirect(self, flash):
+        self._go("/dashboard?m=" + flash)
+
+    def _login_post(self, raw):
+        ip, t = self._ip(), time.time()
+        fails = [x for x in LOGIN_FAILS.get(ip, []) if x > t - FAIL_WINDOW]
+        if len(fails) >= MAX_FAILS:
+            LOGIN_FAILS[ip] = fails
+            return self._go("/login?e=blocked")
+        f = {k: v[0] for k, v in urllib.parse.parse_qs(raw.decode("utf-8", "replace")).items()}
+        ok = bool(DASH_PASSWORD) and secrets.compare_digest(f.get("password", ""), DASH_PASSWORD) and (
+            not DASH_USER or secrets.compare_digest(f.get("username", "").strip(), DASH_USER))
+        if not ok:
+            fails.append(t)
+            LOGIN_FAILS[ip] = fails
+            log("LOGIN XATO", ip)
+            return self._go("/login?e=bad")
+        LOGIN_FAILS.pop(ip, None)
+        token = session_new()
+        log("LOGIN", ip)
+        self._go("/dashboard", f"{SESSION_COOKIE}={token}; Path=/; Max-Age={SESSION_TTL}; HttpOnly; Secure; SameSite=Strict")
+
     def _dashboard_post(self, raw):
-        if not self._auth():
-            return
+        if not self._session():
+            return self._go("/login?e=expired")
         fl = urllib.parse.parse_qs(raw.decode("utf-8", "replace"))
         f = {k: v[0] for k, v in fl.items()}
         path = self.path.split("?")[0]
@@ -1413,6 +1511,8 @@ class Handler(BaseHTTPRequestHandler):
             raw = self.rfile.read(min(n, 200_000))
         except Exception:
             return self._out(400, {"error": "bad request"})
+        if self.path.split("?")[0] == "/login":
+            return self._login_post(raw)
         if self.path.startswith("/dashboard/"):
             return self._dashboard_post(raw)
         try:
@@ -1445,18 +1545,34 @@ class Handler(BaseHTTPRequestHandler):
             js = js.replace("// ==/UserScript==", f"// @updateURL    {url}/skript.user.js\n"
                                                    f"// @downloadURL  {url}/skript.user.js\n// ==/UserScript==", 1)
             return self._out(200, js, "text/javascript; charset=utf-8")
-        if self.path.split("?")[0] not in ("/", "/dashboard"):
+        path = self.path.split("?")[0]
+        qs = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+        if path == "/login":
+            if self._session():
+                return self._go("/dashboard")
+            return self._out(200, render_login(qs.get("e", [""])[0]), "text/html; charset=utf-8")
+        if path == "/logout":
+            c = http.cookies.SimpleCookie()
+            try:
+                c.load(self.headers.get("Cookie", ""))
+            except Exception:
+                pass
+            m = c.get(SESSION_COOKIE)
+            session_end(m.value if m else "")
+            return self._go("/login?e=out", f"{SESSION_COOKIE}=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict")
+        if path not in ("/", "/dashboard"):
             return self._out(404, "not found", "text/plain")
-        if not self._auth():
-            return
-        flash = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).get("m", [""])[0]
-        self._out(200, render_dashboard(flash), "text/html; charset=utf-8")
+        exp = self._session()
+        if not exp:
+            return self._go("/login")
+        self._out(200, render_dashboard(qs.get("m", [""])[0], exp), "text/html; charset=utf-8")
 
 
 def main():
     if not DASH_PASSWORD:
         print("⚠️  config.json: DASHBOARD_PASSWORD bo'sh — dashboard ochilmaydi.")
-    server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+    # Serverda "BIND": "127.0.0.1" — dashboardga faqat tunnel orqali kiriladi
+    server = ThreadingHTTPServer((CFG.get("BIND", "0.0.0.0"), PORT), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     threading.Thread(target=scheduler, daemon=True).start()
     print(f"Bot ishga tushdi. Dashboard: {PUBLIC_URL}/dashboard")

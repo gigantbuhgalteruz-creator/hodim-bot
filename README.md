@@ -8,7 +8,8 @@ Faqat Python standart kutubxonasi (pip shart emas). Ma'lumotlar SQLite (`data.db
 - **Jarimalar (oy bo'yicha):** 1-kechikish 10%, 2-si 30% + ogohlantirish, 3-si — faqat owner'ga xabar (qarorni owner qiladi). `/forgive` bekor qiladi.
 - **soliq.uz hisobotlari:** skript hodim kirgan kabinet jurnalini kuzatadi; "Отправить" dan keyin bir necha soniyada owner'ga xabar: 🟢 vaqtida, 🟡 tekshiruvda, 🚨🔴 kechikkan/xato.
 - **Biriktirish tarixi:** korxona qaysi hodimga qaysi sanadan qaysi sanagacha biriktirilgani saqlanadi; hisobot o'sha sanadagi mas'ul hodim nomida qoladi.
-- **Dashboard:** samaradorlik, davomat, jarimalar, rangli hisobotlar, hodim/korxona qo'shish, ko'chirish, ishdan bo'shatish, tarix. Basic auth (`DASHBOARD_USER` / `DASHBOARD_PASSWORD`).
+- **Dashboard:** samaradorlik, davomat, jarimalar, rangli hisobotlar, hodim/korxona qo'shish, ko'chirish, ishdan bo'shatish, tarix. Login sahifasi (`DASHBOARD_USER` / `DASHBOARD_PASSWORD`), sessiya 60 daqiqa
+  (`SESSION_MINUTES`), HttpOnly+Secure+SameSite=Strict cookie, 15 daqiqada 10 xato → blok, CSRF, xavfsizlik headerlari.
 
 ## Fayllar
 | Fayl | Vazifasi |
@@ -41,4 +42,5 @@ Hodim: `/start`, `/key`, `/me`, yumaloq video.
 - `WORK_START`, `WORK_END`, `WORK_DAYS` (0=Du), `HOLIDAYS` (`"2026-12-08"`)
 - `VIOLATION_PERIOD`: `"month"` — har oy qaytadan; `"all"` — umuman
 - `ABSENT_IS_VIOLATION`, `FORWARD_VIDEOS_TO_OWNER`
-- `DASHBOARD_USER`, `DASHBOARD_PASSWORD`, `PORT`, `PUBLIC_URL` (tunnel o'zi yozadi)
+- `DASHBOARD_USER`, `DASHBOARD_PASSWORD`, `SESSION_MINUTES` (standart 60), `PORT`, `PUBLIC_URL` (tunnel o'zi yozadi)
+- `BIND`: serverda `"127.0.0.1"` — dashboardga faqat tunnel orqali kiriladi

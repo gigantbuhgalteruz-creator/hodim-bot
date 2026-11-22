@@ -2,6 +2,8 @@
   "BOT_TOKEN": "BOTFATHER_BERGAN_TOKEN",
   "OWNER_ID": 123456789,
   "PORT": 8080,
+  "BIND": "127.0.0.1",
+  "SESSION_MINUTES": 60,
   "PUBLIC_URL": "http://localhost:8080",
   "DASHBOARD_USER": "user",
   "DASHBOARD_PASSWORD": "kuchli-parol",
