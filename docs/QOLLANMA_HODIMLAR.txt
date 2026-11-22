@@ -1,0 +1,63 @@
+📗 QO'LLANMA: HODIMLAR UCHUN
+Bot: @tekshiruvbuxgalterbot
+
+Sizdan 2 ta narsa talab qilinadi:
+1) Har kuni ishga kelganingizda botga yumaloq video yuborish.
+2) Kompyuteringizga bir marta skript o'rnatish — soliq.uz hisobotlaringiz rahbarga o'zi boradi.
+
+━━━━━━━━━━━━━━━
+1️⃣ BOTGA ULANISH (bir marta)
+
+1. Telegramda @tekshiruvbuxgalterbot ni oching va /start bosing.
+2. Bot sizga Telegram ID raqamingizni ko'rsatadi — shu raqamni rahbarga yuboring.
+3. Rahbar sizni qo'shgach, bot sizga KALIT va HAVOLA yuboradi.
+   ⚠️ Kalitni hech kimga bermang — u sizning ismingizga bog'langan.
+
+━━━━━━━━━━━━━━━
+2️⃣ HAR KUNI: DAVOMAT 📹
+
+Har ish kuni (Du–Ju) soat 09:00 gacha botga YUMALOQ VIDEO yuboring:
+• Botdagi mikrofon tugmasini bir marta bosing — kamera belgisi chiqadi.
+• Kamera belgisini bosib turib, 2–3 soniya yozing va qo'yib yuboring.
+
+09:00 dan keyin = kechikish. Umuman yubormasangiz = kelmagan.
+❌ Oddiy video yoki qayta yuborilgan (forward) video qabul qilinmaydi.
+O'z natijangizni ko'rish: botga /me yozing.
+
+━━━━━━━━━━━━━━━
+3️⃣ SKRIPTNI O'RNATISH (bir marta, 5 daqiqa, Google Chrome'da)
+
+1. Tampermonkey o'rnating:
+   https://chromewebstore.google.com/detail/dhdgffkkebhmkfjojejmpbldmpobfkfo
+   → "Установить" → "Установить расширение".
+
+2. Ruxsat bering (MUHIM!):
+   Manzil qatoriga yozing: chrome://extensions
+   → Tampermonkey → "Сведения"
+   → "Разрешить пользовательские скрипты" ni YOQING.
+   (Bu tugma bo'lmasa: o'ng yuqoridagi "Режим разработчика" ni yoqing.)
+
+3. Skriptni o'rnating:
+   Botga /key yozing → kelgan havolani Chrome'da oching → "Установить".
+
+4. Kalitni kiriting:
+   oldmy.soliq.uz ga odatdagidek ЭЦП bilan kiring.
+   Oyna chiqadi → botdan olgan KALITni qo'ying → OK.
+   Tampermonkey ruxsat so'rasa → "Всегда разрешать для домена" ni bosing.
+   "✅ Kalit to'g'ri: Ismingiz" chiqsa — tayyor!
+
+━━━━━━━━━━━━━━━
+4️⃣ HISOBOT YUBORISH
+
+Odatdagidek ishlaysiz: formani to'ldirasiz → "Отправить" → ЭЦП bilan imzolaysiz.
+Hisobot rahbarga O'ZI boradi. Qo'shimcha hech narsa bosmaysiz.
+⚠️ Yuborgandan keyin kabinet sahifasini 2–3 daqiqa yopmang.
+
+━━━━━━━━━━━━━━━
+❓ MUAMMO BO'LSA
+
+• "Kalit noto'g'ri" → Tampermonkey 🧩 → "🔑 Hodim kalitini kiritish" → kalitni qayta kiriting.
+• "server bilan aloqa yo'q" → botga /key yozing → havolani ochib "Обновить" bosing.
+• Tampermonkey 🧩 belgisida qizil raqam yo'q → 3-bo'limning 2-qadamini tekshiring.
+• Eski "soliq-telegram-reports" skripti bo'lsa — Tampermonkey'dan o'chiring.
+• Boshqa muammo → Tampermonkey 🧩 → "🔍 Holatni ko'rish" → skrinshotni rahbarga yuboring.

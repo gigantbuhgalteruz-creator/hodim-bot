@@ -1,0 +1,9 @@
+# Maxfiy va ish ma'lumotlari — repoga QO'SHILMAYDI
+config.json
+config.json.tmp
+*.db
+*.db-journal
+bot.log
+backup/
+cloudflared/
+__pycache__/

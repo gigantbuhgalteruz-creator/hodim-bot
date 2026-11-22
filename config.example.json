@@ -1,0 +1,15 @@
+{
+  "BOT_TOKEN": "BOTFATHER_BERGAN_TOKEN",
+  "OWNER_ID": 123456789,
+  "PORT": 8080,
+  "PUBLIC_URL": "http://localhost:8080",
+  "DASHBOARD_USER": "user",
+  "DASHBOARD_PASSWORD": "kuchli-parol",
+  "WORK_START": "09:00",
+  "WORK_END": "18:30",
+  "WORK_DAYS": [0, 1, 2, 3, 4],
+  "HOLIDAYS": ["2026-12-08", "2027-01-01"],
+  "VIOLATION_PERIOD": "month",
+  "ABSENT_IS_VIOLATION": true,
+  "FORWARD_VIDEOS_TO_OWNER": false
+}
