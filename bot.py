@@ -482,7 +482,8 @@ def handle_report(e, body):
                         now().isoformat()))
             db.commit()
     except sqlite3.IntegrityError:
-        return 200, {"ok": True, "duplicate": True}
+        if "(sinov)" not in status:     # sinov xabari (Tampermonkey menyusidan) har safar yuborilaversin
+            return 200, {"ok": True, "duplicate": True}
 
     c = q("SELECT * FROM companies WHERE inn=?", (inn,), one=True)
     if not c or c["active"] == 0:
