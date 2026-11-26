@@ -7,6 +7,11 @@ Faqat Python standart kutubxonasi (pip shart emas). Ma'lumotlar SQLite (`data.db
 - **Davomat:** hodim har ish kuni 09:00 gacha botga yumaloq video yuboradi (vaqt Telegram serveridan). 09:05 da davomat, 18:30 da "kelmaganlar", juma 18:35 da haftalik hisobot owner'ga keladi.
 - **Jarimalar (oy bo'yicha):** 1-kechikish 10%, 2-si 30% + ogohlantirish, 3-si — faqat owner'ga xabar (qarorni owner qiladi). `/forgive` bekor qiladi.
 - **soliq.uz hisobotlari:** skript hodim kirgan kabinet jurnalini kuzatadi; "Отправить" dan keyin bir necha soniyada owner'ga xabar: 🟢 vaqtida, 🟡 tekshiruvda, 🚨🔴 kechikkan/xato.
+- **Hisobotlar jadvali (`/hisobotlar`, Excel o'rniga):** korxona × soliq turi × oy. Hodim soliq.uz da "Отправить" bosgach
+  katak o'zi to'ladi (QQS, JShDS, aylanma, foyda, balans ... hisobot nomidan aniqlanadi; davr — "Год"+"Период").
+  Kerakli, lekin topshirilmagan kataklar "qarz"/"kutilmoqda" bo'lib ko'rinadi. Katakni qo'lda belgilash, yangi mijoz,
+  izoh, CSV (Excel) yuklab olish. Telegram: `/qarz [10.2026]`. Eski Excel bir marta `import_excel.py` bilan ko'chirilgan
+  (Excel davrlari tarix sifatida aynan ko'rsatiladi).
 - **Biriktirish tarixi:** korxona qaysi hodimga qaysi sanadan qaysi sanagacha biriktirilgani saqlanadi; hisobot o'sha sanadagi mas'ul hodim nomida qoladi.
 - **Dashboard:** samaradorlik, davomat, jarimalar, rangli hisobotlar, hodim/korxona qo'shish, ko'chirish, ishdan bo'shatish, tarix. Login sahifasi (`DASHBOARD_USER` / `DASHBOARD_PASSWORD`), sessiya 60 daqiqa
   (`SESSION_MINUTES`), HttpOnly+Secure+SameSite=Strict cookie, 15 daqiqada 10 xato → blok, CSRF, xavfsizlik headerlari.
@@ -15,6 +20,7 @@ Faqat Python standart kutubxonasi (pip shart emas). Ma'lumotlar SQLite (`data.db
 | Fayl | Vazifasi |
 |---|---|
 | `bot.py` | Telegram bot (long polling), scheduler, HTTP API + dashboard (port 8080) |
+| `import_excel.py` | "Список клиенти" Excel'ini bazaga ko'chirish: `python3 import_excel.py fayl.xlsx --apply` |
 | `tunnel.py` | Cloudflare quick tunnel; yangi manzilni `config.json`, bot profili (t.me) ga yozadi va owner'ga yuboradi |
 | `soliq-hisobot.user.js` | Tampermonkey skripti (server uni `/skript.user.js` da joriy manzil bilan tarqatadi) |
 | `config.example.json` | `config.json` namunasi (haqiqiy `config.json` repoga qo'shilmaydi — token bor) |
@@ -35,7 +41,7 @@ systemctl start hodim-bot hodim-tunnel
 
 ## Owner buyruqlari (to'liq ro'yxat — botda `/help`)
 `/add`, `/salary`, `/remove`, `/list`, `/firma`, `/assign`, `/unassign`, `/kochir`, `/move`, `/tarix`,
-`/today`, `/week`, `/month`, `/forgive`, `/dashboard`, `/cancel`.
+`/today`, `/week`, `/month`, `/forgive`, `/qarz`, `/dashboard`, `/cancel`.
 Hodim: `/start`, `/key`, `/me`, yumaloq video.
 
 ## Sozlamalar (`config.json`)

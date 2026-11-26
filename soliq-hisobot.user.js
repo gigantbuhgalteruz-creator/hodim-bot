@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Soliq.uz → Hodim bot: hisobotlar
 // @namespace    soliq-telegram
-// @version      3.4
+// @version      3.5
 // @description  Hodim soliq.uz kabinetida ishlayotganda hisobotlar jurnalini fonda tekshiradi va yangi/o'zgargan hisobotlarni bot serveriga yuboradi (bot ularni faqat ownerga jo'natadi).
 // @match        https://oldmy.soliq.uz/*
 // @grant        GM_xmlhttpRequest
@@ -23,6 +23,7 @@
   const BOT_USERNAME  = 'tekshiruvbuxgalterbot';  // server manzili shu bot profilidan olinadi (tunnel o'zgarsa)
   const CHECK_MINUTES = 2;                        // jurnalni necha daqiqada tekshirish
   const SKIP_DRAFTS   = true;                      // "Черновик"larni yubormaslik
+  const SYNC_DAYS     = 60;                        // birinchi kirishda shu kunlardagi eski hisobotlar jadvalga jim yuboriladi
   // Hodim kaliti har bir kompyuterda bir marta so'raladi (botda /key buyrug'i).
   // =================================================
 
@@ -148,6 +149,11 @@
   const pad = n => String(n).padStart(2, '0');
   const d0 = new Date();
   const TODAY = `${pad(d0.getDate())}.${pad(d0.getMonth() + 1)}.${d0.getFullYear()}`;
+  const sentAt = rec => {   // "DD.MM.YYYY HH:MM:SS" -> Date (yoki null)
+    const m = (rec['Дата отправки'] || '').match(/(\d{2})\.(\d{2})\.(\d{4})/);
+    return m ? new Date(+m[3], +m[2] - 1, +m[1]) : null;
+  };
+  const isRecent = rec => { const d = sentAt(rec); return !!d && (Date.now() - d) < SYNC_DAYS * 864e5; };
   async function check() {
     if (!KEY) { diag.result = 'kalit kiritilmagan'; return; }
     if (busy) return;
@@ -161,16 +167,25 @@
       const seen = loadSeen();
       const firstRun = Object.keys(seen).length === 0;
       const ids = [...reports.keys()].sort((a, b) => Number(a) - Number(b));
-      let sentNow = 0;
-      diag.result = firstRun ? 'birinchi kirish: eski hisobotlar eslab qolindi' : 'yangi hisobot yo\'q';
+      let sentNow = 0, syncFail = false;
+      const SYNC_KEY = 'soliq_table_synced_v35_' + myInn;   // v3.5: eski hisobotlar jadvalga bir marta jim yuboriladi
+      const needSync = !GM_getValue(SYNC_KEY, false);
+      diag.result = firstRun ? 'birinchi kirish: eski hisobotlar jadvalga yozildi' : 'yangi hisobot yo\'q';
       for (const id of ids) {
         const item = reports.get(id);
         const status = item.rec['Состояние'] || '';
-        if (seen[id] === status) continue;
-        // Birinchi kirish: eskilarini yubormaymiz, lekin BUGUN yuborilganlarini yuboramiz (yo'qolib qolmasin).
-        if (firstRun && !(item.rec['Дата отправки'] || '').includes(TODAY)) { seen[id] = status; continue; }
+        if (seen[id] === status) {
+          if (needSync && isRecent(item.rec)) {
+            try { await post('/api/report', Object.assign({ silent: true }, item)); } catch (e) { syncFail = true; }
+          }
+          continue;
+        }
+        // Birinchi kirish: eskilari rahbarga xabar bo'lib bormaydi — faqat jadvalga jim yoziladi (SYNC_DAYS ichidagilari).
+        // BUGUN yuborilganlari esa odatdagidek xabar bo'lib boradi.
+        const silent = firstRun && !(item.rec['Дата отправки'] || '').includes(TODAY);
+        if (silent && !isRecent(item.rec)) { seen[id] = status; continue; }
         try {
-          await post('/api/report', item);
+          await post('/api/report', silent ? Object.assign({ silent: true }, item) : item);
           seen[id] = status; saveSeen(seen);
           sentNow++; diag.sent++;
           diag.result = `yuborildi: ${sentNow} ta`;
@@ -178,10 +193,12 @@
           if (e.status === 401 && !keyWarned) { keyWarned = true; alert('❌ Hodim kaliti noto\'g\'ri. Tampermonkey menyusi → "🔑 Hodim kalitini kiritish".'); }
           console.warn('[soliq→bot] yuborilmadi', e);
           diag.result = 'yuborishda xato'; diag.error = e.message;
+          syncFail = true;
           break;                                            // keyingi tekshiruvda qayta urinadi
         }
       }
       saveSeen(seen);
+      if (needSync && !syncFail) GM_setValue(SYNC_KEY, true);
     } catch (e) {
       console.warn('[soliq→bot] tekshiruv xatosi', e);
       diag.result = 'tekshiruv xatosi'; diag.error = e.message;
@@ -207,6 +224,15 @@
       const test = Object.assign({}, item, { rec: Object.assign({}, item.rec, { 'Состояние': item.rec['Состояние'] + ' (sinov)' }) });
       await post('/api/report', test);
       alert('Yuborildi ✔');
+    } catch (e) { alert('Xato: ' + e.message); }
+  });
+  GM_registerMenuCommand('📋 Hamma hisobotlarni jadvalga yuborish (xabarsiz)', async () => {
+    try {
+      const reports = parseReports(await getJournalDoc());
+      if (![...reports.values()].length || [...reports.values()][0].inn !== myInn) return alert('Hisobot topilmadi.');
+      let n = 0;
+      for (const item of reports.values()) { await post('/api/report', Object.assign({ silent: true }, item)); n++; }
+      alert(`Jadvalga yuborildi: ${n} ta hisobot ✔`);
     } catch (e) { alert('Xato: ' + e.message); }
   });
   GM_registerMenuCommand('♻️ Shu firma xotirasini tozalash', async () => {

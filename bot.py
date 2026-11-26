@@ -122,6 +122,22 @@ if not db.execute("SELECT 1 FROM assignments LIMIT 1").fetchone():
     db.execute("INSERT INTO assignments(inn,tg_id,start,end,created) "
                "SELECT inn, tg_id, '2000-01-01', NULL, datetime('now') FROM companies WHERE tg_id IS NOT NULL")
     db.commit()
+# Hisobotlar jadvali (Excel o'rniga): korxona × soliq turi × davr (YYYY-MM).
+# filings.source: 'soliq' (skriptdan), 'excel' (eski Excel'dan import), 'manual' (dashboardda qo'lda).
+db.executescript("""
+CREATE TABLE IF NOT EXISTS filings(
+  inn TEXT, period TEXT, tax TEXT, status TEXT, source TEXT, report_id TEXT, detail TEXT, ts TEXT,
+  PRIMARY KEY(inn, period, tax));
+CREATE INDEX IF NOT EXISTS ix_fil_period ON filings(period);
+-- Korxona qaysi soliqni topshiradi: freq 'm' har oy, 'q' chorakda (3,6,9,12-oy); required=0 — topshirmaydi.
+CREATE TABLE IF NOT EXISTS obligations(
+  inn TEXT, tax TEXT, required INTEGER, freq TEXT DEFAULT 'm', source TEXT DEFAULT 'manual', PRIMARY KEY(inn, tax));
+""")
+for _col, _typ in (("activity", "TEXT"), ("staff", "TEXT"), ("c1", "TEXT"), ("note", "TEXT"),
+                   ("sort", "INTEGER"), ("active", "INTEGER DEFAULT 1")):
+    if _col not in {r[1] for r in db.execute("PRAGMA table_info(companies)")}:
+        db.execute(f"ALTER TABLE companies ADD COLUMN {_col} {_typ}")
+db.commit()
 
 
 def q(sql, args=(), one=False):
@@ -452,6 +468,14 @@ def handle_report(e, body):
     c = q("SELECT * FROM companies WHERE inn=?", (inn,), one=True)
     if c and company and not c["name"]:
         q("UPDATE companies SET name=? WHERE inn=?", (company, inn))
+    if inn and not c:   # yangi mijoz — jadvalda ko'rinsin (hodimga keyin biriktiriladi)
+        q("INSERT OR IGNORE INTO companies(inn,name,tg_id) VALUES(?,?,NULL)", (inn, company))
+    try:
+        record_filing(inn, rec, e["name"], now().isoformat())
+    except Exception:
+        log("FILING ERROR", traceback.format_exc())
+    if body.get("silent"):   # skript eski hisobotlarni jadval uchun yubordi — Telegram'ga xabar shart emas
+        return 200, {"ok": True, "silent": True}
     resp = responsible(inn, report_day(rec, now().isoformat()))   # hisobot sanasidagi mas'ul hodim
     if resp is None:
         note = "⚠️ Bu firma hech bir hodimga biriktirilmagan"
@@ -491,6 +515,232 @@ def handle_report(e, body):
     lines.append(f"#INN{inn}")
     send(OWNER, "\n".join(lines))
     return 200, {"ok": True}
+
+
+# ---------------------------------------------------------------- hisobotlar jadvali (Excel o'rniga)
+# (kod, jadvaldagi nom, Excel'dagi nom) — jadval ustunlari shu tartibda
+TAXES = [("jshds", "JShDS / IJS", "Подоход И ЕСП"), ("inps", "INPS", "ИНПС"), ("nds", "QQS", "НДС"),
+         ("div", "Dividend", "ДИВИДЕНД"), ("enp", "Aylanma (ENP)", "ЕНП"), ("prib", "Foyda", "ПРИБЫЛЬ"),
+         ("imush", "Mol-mulk", "ИМУЩ."), ("zem", "Yer", "ЗЕМЛЯ"), ("voda", "Suv", "ВОДА"),
+         ("akciz", "Aksiz", "АКЦИЗ"), ("balans", "Balans", "Баланс"), ("finres", "Moliyaviy natija", "Фин. Резуль"),
+         ("stat", "Statistika", "СТАТИСТИКА")]
+TAX_NAME = {k: n for k, n, _ in TAXES}
+# soliq.uz hisobot nomi (kichik harf) -> kod. Tartib muhim: "дивиденд" "доходы" dan oldin tekshiriladi.
+TAX_MATCH = [("div", ("дивиденд",)), ("jshds", ("доходов физических", "доходы физических", "социальн", "ндфл")),
+             ("inps", ("накопительн",)), ("nds", ("добавленн",)),
+             ("enp", ("с оборота", "единого налогового", "единый налог")), ("prib", ("на прибыль",)),
+             ("imush", ("имуществ",)), ("zem", ("земельн", "за землю")), ("voda", ("водн",)), ("akciz", ("акциз",)),
+             ("balans", ("баланс",)), ("finres", ("финансовых результат",)), ("stat", ("статист",))]
+RU_MONTHS = [("январ", 1), ("феврал", 2), ("март", 3), ("апрел", 4), ("май", 5), ("мая", 5), ("июн", 6),
+             ("июл", 7), ("август", 8), ("сентябр", 9), ("октябр", 10), ("ноябр", 11), ("декабр", 12)]
+UZ_MONTHS = ["", "Yanvar", "Fevral", "Mart", "Aprel", "May", "Iyun", "Iyul", "Avgust", "Sentyabr", "Oktyabr",
+             "Noyabr", "Dekabr"]
+DUE_DAY = int(CFG.get("REPORT_DUE_DAY", 25))   # davrdan keyingi oyning shu sanasigacha topshirilmasa — "qarz"
+FIL_RANK = {"ok": 3, "late": 3, "wait": 2, "error": 1}
+
+
+def tax_of(form):
+    s = (form or "").lower()
+    for code, words in TAX_MATCH:
+        if any(w in s for w in words):
+            return code
+    return ("x:" + " ".join(str(form).split())[:80]) if form else None
+
+
+def report_period(rec, ts):
+    """soliq.uz 'Год' + 'Период' -> 'YYYY-MM' (chorak/yil — oxirgi oyi). Aniqlanmasa — yuborilgan oydan oldingi oy."""
+    y = re.search(r"(20\d\d)", str(rec.get("Год") or ""))
+    p = str(rec.get("Период") or "").lower()
+    m = next((n for k, n in RU_MONTHS if k in p), None)
+    if m is None:
+        qm = re.search(r"\b(iv|iii|ii|i|[1-4])\s*-?\s*(?:й\s*)?квартал", p)
+        if qm:
+            m = 3 * ({"i": 1, "ii": 2, "iii": 3, "iv": 4}.get(qm.group(1)) or int(qm.group(1)))
+        elif "полугод" in p:
+            m = 6
+        elif "9" in p and "мес" in p:
+            m = 9
+        elif "год" in p:
+            m = 12
+    if y and m:
+        return f"{y.group(1)}-{m:02d}"
+    d = datetime.fromisoformat(report_day(rec, ts)[:10]).date().replace(day=1) - timedelta(days=1)
+    return f"{d:%Y-%m}"
+
+
+def filing_status(status, error_reason=None):
+    s = (status or "").lower()
+    if error_reason or any(w in s for w in ("ошиб", "отклон", "отказ", "аннулир")):
+        return "error"
+    if "опоздан" in s:
+        return "late"
+    return "ok" if status_level(status)[0] == "good" else "wait"
+
+
+def record_filing(inn, rec, sender, ts):
+    """soliq.uz hisobotini jadval katagiga yozadi. Bir katakka bir nechta hisobot bo'lsa (tuzatish),
+    eng yangisi qoladi — faqat yangisi xato bo'lib, avvalgisi qabul qilingan bo'lsa, qabul qilingani qoladi."""
+    rid = str(rec.get("№ Отчета", "")).strip()
+    tax = tax_of(rec.get("Наименование"))
+    if not inn or not tax or not rid.isdigit():
+        return
+    per = report_period(rec, ts)
+    st = filing_status(rec.get("Состояние"), rec.get("Причина ошибки"))
+    detail = json.dumps({"by": sender, "rec": rec}, ensure_ascii=False)   # soliq.uz dan kelgan hamma maydon
+    with LOCK:
+        old = db.execute("SELECT * FROM filings WHERE inn=? AND period=? AND tax=?", (inn, per, tax)).fetchone()
+        if old and old["source"] == "soliq" and old["report_id"] != rid:
+            newer = int(rid) > int(old["report_id"] or 0)
+            if (newer and st == "error" and old["status"] in ("ok", "late")) or \
+               (not newer and FIL_RANK.get(st, 0) <= FIL_RANK.get(old["status"], 0)):
+                return
+        db.execute("INSERT OR REPLACE INTO filings(inn,period,tax,status,source,report_id,detail,ts) "
+                   "VALUES(?,?,?,?,'soliq',?,?,?)", (inn, per, tax, st, rid, detail, ts))
+        db.commit()
+
+
+def backfill_filings(inn=None):
+    """Jadval paydo bo'lishidan oldin kelgan hisobotlarni ham jadvalga yozadi (takror ishlatsa zarari yo'q).
+    inn berilsa — faqat shu korxona (qo'lda belgi olib tashlanganda avtomatik holatni tiklash uchun)."""
+    for r in q("SELECT r.*, e.name ename FROM reports r LEFT JOIN employees e ON e.tg_id=r.tg_id "
+               + ("WHERE r.inn=? " if inn else "") + "ORDER BY r.ts", (inn,) if inn else ()):
+        try:
+            record_filing(r["inn"], json.loads(r["data"] or "{}"), r["ename"] or "", r["ts"])
+        except Exception:
+            log("BACKFILL ERROR", r["report_id"], traceback.format_exc())
+
+
+def period_label(per):
+    return f"{UZ_MONTHS[int(per[5:7])]} {per[:4]}"
+
+
+def period_shift(per, n):
+    y, m = int(per[:4]), int(per[5:7]) - 1 + n
+    return f"{y + m // 12}-{m % 12 + 1:02d}"
+
+
+def default_period():
+    """Hozir topshirilayotgan davr — o'tgan oy (noyabrda oktyabr hisobotlari topshiriladi)."""
+    return period_shift(f"{now():%Y-%m}", -1)
+
+
+def period_due(per):
+    return datetime.fromisoformat(period_shift(per, 1) + f"-{DUE_DAY:02d}").date()
+
+
+_CYR = dict(zip("абвгдеёжзийклмнопрстуфхцчшщъыьэюяўқғҳ",
+                ["a", "b", "v", "g", "d", "e", "yo", "j", "z", "i", "y", "k", "l", "m", "n", "o", "p", "r", "s", "t",
+                 "u", "f", "x", "ts", "ch", "sh", "sh", "", "i", "", "e", "yu", "ya", "o", "q", "g", "h"]))
+
+
+def name_key(s):
+    """'Нилуфар' va 'Nilufar Karimova' -> 'nilufar' (birinchi so'z, lotincha) — Excel ismini bot hodimiga moslash."""
+    w = (str(s or "").split() or [""])[0].lower()
+    return re.sub(r"[^a-z]", "", "".join(_CYR.get(ch, ch) for ch in w).replace("'", ""))
+
+
+def make_cell(f, o, month, hist, overdue):
+    """filings qatori (f) va majburiyat (o) -> jadval katagi."""
+    expected = not hist and bool(o and o["required"] and (o["freq"] != "q" or month % 3 == 0))
+    if f:
+        return {"st": f["status"], "src": f["source"], "rid": f["report_id"], "ts": f["ts"],
+                "detail": f["detail"], "expected": expected}
+    if expected:
+        return {"st": "missing" if overdue else "pending", "expected": True}
+    return {"st": None, "expected": False, "never": bool(o and not o["required"])}
+
+
+def is_hist(per):
+    xl_last = (q("SELECT v FROM meta WHERE k='excel_last_period'", one=True) or {"v": ""})["v"]
+    return bool(xl_last) and per <= xl_last
+
+
+def one_cell(inn, per, tax):
+    return make_cell(q("SELECT * FROM filings WHERE inn=? AND period=? AND tax=?", (inn, per, tax), one=True),
+                     q("SELECT * FROM obligations WHERE inn=? AND tax=?", (inn, tax), one=True),
+                     int(per[5:7]), is_hist(per), now().date() > period_due(per))
+
+
+def period_matrix(per):
+    """Davr jadvali: {"rows": [...], "taxes": [kod...], "other": bool}. Har katak:
+    {"st": ok|late|wait|error|na|note|missing|None, "src", "detail", "expected"}."""
+    last_day = (datetime.fromisoformat(period_shift(per, 1) + "-01").date() - timedelta(days=1)).isoformat()
+    month = int(per[5:7])
+    fil = {}
+    for f in q("SELECT * FROM filings WHERE period=?", (per,)):
+        fil.setdefault(f["inn"], {})[f["tax"]] = f
+    obl = {}
+    for o in q("SELECT * FROM obligations"):
+        obl.setdefault(o["inn"], {})[o["tax"]] = o
+    # Excel davrlari (import qilingan oxirgi oygacha) — tarix: faqat o'sha oyda bor bo'lgan ma'lumot ko'rsatiladi.
+    hist = is_hist(per)
+    comps = q("SELECT * FROM companies WHERE (COALESCE(active,1)=1 AND ?=0) OR inn IN "
+              "(SELECT inn FROM filings WHERE period=?) ORDER BY sort IS NULL, sort, name", (int(hist), per))
+    known = {c["inn"] for c in comps}
+    extra = [{"inn": i, "name": "", "activity": "", "staff": "", "c1": "", "note": "", "active": 0, "tg_id": None}
+             for i in fil if i not in known]
+    overdue = now().date() > period_due(per)
+    by_key = {}
+    for e_ in active_employees():
+        by_key.setdefault(name_key(e_["name"]), []).append(e_["name"])
+    used, other, rows = set(), False, []
+    for c in list(comps) + extra:
+        c = dict(c)
+        inn = c["inn"]
+        resp = responsible(inn, last_day)
+        cells = {}
+        for code, _n, _x in TAXES:
+            f = fil.get(inn, {}).get(code)
+            cells[code] = make_cell(f, obl.get(inn, {}).get(code), month, hist, overdue)
+            if f or cells[code]["expected"]:
+                used.add(code)
+        others = [f for t, f in fil.get(inn, {}).items() if t.startswith("x:")]
+        other = other or bool(others)
+        same = by_key.get(name_key(c.get("staff"))) if c.get("staff") else None
+        staff = emp_name(resp) if resp else (same[0] if same and len(same) == 1 else (c.get("staff") or ""))
+        rows.append({"c": c, "resp": resp, "staff": staff, "staff_is_bot": resp is not None,
+                     "cells": cells, "others": others})
+    return {"rows": rows, "taxes": [k for k, _n, _x in TAXES if k in used], "other": other, "overdue": overdue}
+
+
+def matrix_counts(m):
+    """Jami va hodim bo'yicha: kerak / topshirilgan / qarz / xato."""
+    tot = {"need": 0, "done": 0, "missing": 0, "bad": 0}
+    by = {}
+    for r in m["rows"]:
+        s = by.setdefault(r["staff"] or "—", {"need": 0, "done": 0, "missing": 0, "bad": 0})
+        for cell in r["cells"].values():
+            st = cell["st"]
+            if st not in ("ok", "late", "wait", "error", "missing", "pending"):
+                continue
+            for d in (tot, s):
+                d["need"] += 1
+                d["done"] += st in ("ok", "late")
+                d["missing"] += st in ("missing", "pending")
+                d["bad"] += st in ("error", "late")
+    return tot, by
+
+
+def debt_text(per=None):
+    per = per or default_period()
+    m = period_matrix(per)
+    tot, _by = matrix_counts(m)
+    lines = [f"📋 <b>{period_label(per)} hisobotlari</b>",
+             f"Kerak: {tot['need']} · ✅ topshirildi: {tot['done']} · ⏳ qolgan: {tot['missing']} · ⚠️ xato/kech: {tot['bad']}",
+             f"Muddat (taxminan): {period_due(per):%d.%m.%Y}", ""]
+    groups = {}
+    for r in m["rows"]:
+        miss = [TAX_NAME[k] for k, cell in r["cells"].items() if cell["st"] in ("missing", "pending", "error")]
+        if miss:
+            groups.setdefault(r["staff"] or "biriktirilmagan", []).append(f"   • {esc(r['c']['name'] or r['c']['inn'])}: "
+                                                                      f"{esc(', '.join(miss))}")
+    for who in sorted(groups):
+        lines.append(f"👷 <b>{esc(who)}</b> — {len(groups[who])} ta korxona")
+        lines += groups[who]
+    if not groups:
+        lines.append("🎉 Hamma hisobotlar topshirilgan.")
+    lines.append(f"\n📊 Jadval: {current_url()}/hisobotlar?p={per}")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------- employees & companies (bot + dashboard)
@@ -774,6 +1024,7 @@ OWNER_HELP = f"""👑 <b>Owner buyruqlari</b>
 /week — shu hafta
 /month — shu oy
 /forgive TG_ID — oxirgi qoidabuzarlikni bekor qilish
+/qarz [10.2026] — qaysi korxonaning qaysi hisoboti hali topshirilmagan (standart: o'tgan oy)
 /dashboard — dashboard havolasi
 
 Ish vaqti: {WORK_START}–{WORK_END}, hodim {WORK_START} gacha yumaloq video yuboradi."""
@@ -919,9 +1170,22 @@ def handle_owner(text):
             return send(OWNER, "Qoidabuzarlik yo'q.")
         q("DELETE FROM violations WHERE id=?", (v["id"],))
         send(OWNER, f"✅ {v['day']} dagi qoidabuzarlik bekor qilindi.")
+    elif cmd in ("/qarz", "/jadval"):
+        per = None
+        if args:
+            m = re.match(r"^(\d{1,2})[./-](\d{4})$", args[0]) or re.match(r"^(\d{4})-(\d{1,2})$", args[0])
+            if not m:
+                return send(OWNER, "Foydalanish: /qarz 10.2026")
+            a1, a2 = m.groups()
+            mm, yy = (int(a1), a2) if len(a2) == 4 else (int(a2), a1)
+            if not 1 <= mm <= 12:
+                return send(OWNER, "Oy 1–12 bo'lishi kerak. Masalan: /qarz 10.2026")
+            per = f"{yy}-{mm:02d}"
+        send(OWNER, debt_text(per))
     elif cmd == "/dashboard":
         url = current_url()
-        send(OWNER, f"📈 Dashboard: {url}/dashboard\n(login va parol bilan kiriladi, 1 soat harakatsiz qolsa o'zi chiqaradi)"
+        send(OWNER, f"📈 Dashboard: {url}/dashboard\n📋 Hisobotlar jadvali: {url}/hisobotlar\n"
+                    f"(login va parol bilan kiriladi, 1 soat harakatsiz qolsa o'zi chiqaradi)"
                     f"\n🧩 Hodimlar skripti: {url}/skript.user.js")
     else:
         send(OWNER, "Noma'lum buyruq. /help")
@@ -1303,6 +1567,7 @@ padding:10px 13px;border-radius:12px;border:1px solid var(--line);background:var
 </style></head><body><div class="wrap">
 <header><h1>Hodimlar samaradorligi</h1>
 <div class="hright"><div class="mut meta glass">Hafta {a:%d.%m} – {b:%d.%m.%Y} · {WORK_START}–{WORK_END} · {now():%H:%M}</div>
+<a class="btn" href="/hisobotlar">📋 Hisobotlar jadvali</a>
 <button class="btn" id="addEmp">+ Hodim qo'shish</button>
 <a class="btn ghost" href="/logout">Chiqish</a></div></header>
 {flash_html}
@@ -1385,6 +1650,494 @@ location.replace('/dashboard?auto=1&active='+(Date.now()-lastAct<60000?1:0))}},6
 </script></body></html>"""
 
 
+MATRIX_CSS = """
+:root{--ink:#2b1a0f;--mut:#97755e;--acc:#f97316;--acc-soft:rgba(249,115,22,.12);
+--glass:rgba(255,255,255,.58);--edge:rgba(255,255,255,.85);--line:rgba(194,65,12,.12);--shadow:rgba(194,65,12,.10);
+--bg1:#fff8f1;--bg2:#ffe9d6;--b1:rgba(251,146,60,.45);--b2:rgba(253,186,116,.5);--solid:#fffaf5;
+--g:#15803d;--g-bg:rgba(34,197,94,.16);--y:#b45309;--y-bg:rgba(251,191,36,.22);--o:#c2410c;--o-bg:rgba(251,146,60,.22);
+--r:#b91c1c;--r-bg:rgba(239,68,68,.14);--n:#8a7565;--n-bg:rgba(120,90,70,.07);--dlg:rgba(255,250,245,.94);--field:rgba(255,255,255,.75)}
+@media (prefers-color-scheme:dark){:root{--ink:#fbeee4;--mut:#c19c84;--acc:#fb923c;--acc-soft:rgba(251,146,60,.16);
+--glass:rgba(48,28,16,.55);--edge:rgba(255,255,255,.10);--line:rgba(251,146,60,.14);--shadow:rgba(0,0,0,.35);
+--bg1:#160c06;--bg2:#24130a;--b1:rgba(234,88,12,.35);--b2:rgba(251,146,60,.2);--solid:#21130b;
+--g:#4ade80;--g-bg:rgba(74,222,128,.15);--y:#fcd34d;--y-bg:rgba(251,191,36,.16);--o:#fdba74;--o-bg:rgba(251,146,60,.18);
+--r:#fca5a5;--r-bg:rgba(248,113,113,.16);--n:#a8917f;--n-bg:rgba(255,255,255,.05);--dlg:rgba(38,22,12,.95);--field:rgba(0,0,0,.25)}}
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;font:14px/1.45 "Segoe UI",system-ui,-apple-system,Roboto,sans-serif;color:var(--ink);
+background:radial-gradient(900px 520px at 8% -8%,var(--b1),transparent 62%),radial-gradient(760px 480px at 105% 6%,var(--b2),transparent 60%),
+linear-gradient(170deg,var(--bg1),var(--bg2));background-attachment:fixed}
+.wrap{max-width:1500px;margin:0 auto;padding:32px 24px 56px}
+.glass{background:var(--glass);border:1px solid var(--edge);border-radius:20px;backdrop-filter:blur(22px) saturate(170%);
+-webkit-backdrop-filter:blur(22px) saturate(170%);box-shadow:0 10px 40px -12px var(--shadow),inset 0 1px 0 var(--edge)}
+header{display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap}
+h1{font-size:25px;font-weight:600;letter-spacing:-.02em;margin:0;display:flex;align-items:center;gap:12px}
+h1:before{content:"";width:12px;height:12px;border-radius:50%;background:var(--acc);box-shadow:0 0 0 6px var(--acc-soft)}
+h2{font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.08em;color:var(--mut);margin:28px 4px 10px}
+.sub,.mut{color:var(--mut)}.sub{font-size:12px}
+.hright{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.btn{font:inherit;font-weight:600;font-size:13px;border:0;border-radius:999px;padding:9px 15px;cursor:pointer;background:var(--acc);
+color:#fff;text-decoration:none;display:inline-block;box-shadow:0 6px 18px -6px var(--acc)}
+.btn.ghost{background:var(--acc-soft);color:var(--acc);box-shadow:none}.btn.red{background:var(--r);box-shadow:none}
+.pnav{display:flex;align-items:center;gap:4px;padding:4px;border-radius:999px}
+.pnav a{width:34px;height:34px;display:grid;place-items:center;border-radius:50%;text-decoration:none;color:var(--acc);font-size:18px;font-weight:600}
+.pnav a:hover{background:var(--acc-soft)}
+.pnav select{font:inherit;font-weight:600;border:0;background:transparent;color:var(--ink);padding:6px 4px;cursor:pointer}
+.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;margin-top:24px}
+.kpi{padding:16px 20px}.kpi span{font-size:13px;color:var(--mut)}
+.kpi b{display:block;font-size:30px;font-weight:600;letter-spacing:-.03em;margin-top:4px}
+.kpi.g b{color:var(--g)}.kpi.r b{color:var(--r)}.kpi.o b{color:var(--o)}.kpi.a b{color:var(--acc)}
+.staff{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(230px,100%),1fr));gap:10px}
+.st{padding:12px 16px;cursor:pointer;border:1px solid var(--edge)}.st.on{outline:2px solid var(--acc)}
+.st .top{display:flex;justify-content:space-between;gap:8px;font-weight:600}
+.bar{height:6px;border-radius:99px;background:var(--n-bg);margin-top:8px;overflow:hidden}.bar i{display:block;height:100%;background:var(--g)}
+.tools{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin:0 0 12px}
+.tools input[type=search],.tools select{font:inherit;padding:9px 14px;border-radius:999px;border:1px solid var(--line);background:var(--field);color:var(--ink);min-width:0}
+.tools input[type=search]{flex:1 1 220px}
+.tools label{display:flex;gap:6px;align-items:center;font-size:13px;cursor:pointer}
+.legend{display:flex;gap:6px 14px;flex-wrap:wrap;font-size:12px;color:var(--mut);margin:0 4px 12px}
+.legend span{display:inline-flex;align-items:center;gap:6px}
+.card{overflow:auto;max-height:calc(100vh - 120px)}
+table{border-collapse:separate;border-spacing:0;width:100%}
+th,td{padding:7px 8px;border-bottom:1px solid var(--line);text-align:left;vertical-align:middle;white-space:nowrap}
+thead th{position:sticky;top:0;z-index:2;background:var(--solid);font-size:11px;color:var(--mut);font-weight:600;
+text-transform:uppercase;letter-spacing:.04em;text-align:center}
+thead th.l{text-align:left}
+td.co,th.co{position:sticky;left:0;z-index:1;background:var(--solid);min-width:240px;max-width:300px;white-space:normal}
+thead th.co{z-index:3}
+td.co b{font-weight:600;cursor:pointer}td.co b:hover{color:var(--acc)}
+tbody tr:hover td{background:var(--acc-soft)}tbody tr:hover td.co{background:var(--solid)}
+td.n{color:var(--mut);font-size:12px;text-align:right}
+.sheet th,.sheet td{border-right:1px solid var(--line)}
+.sheet thead th{white-space:normal;min-width:64px;line-height:1.2;vertical-align:bottom}
+td.ed{cursor:text;min-width:90px;max-width:220px;white-space:normal;font-size:13px}
+td.co.ed{font-weight:600}
+td.ed:hover{box-shadow:inset 0 0 0 1px var(--acc)}
+td.ed[contenteditable=true]{box-shadow:inset 0 0 0 2px var(--acc);background:var(--field);outline:none}
+td.ro{color:var(--mut);font-size:12.5px}
+.saved{animation:sv 1.2s}@keyframes sv{from{background:var(--g-bg)}}
+td.x{padding:0;min-width:104px;text-align:center;cursor:pointer;font-size:12px;font-weight:600;line-height:1.15;color:var(--n)}
+td.x>div{padding:6px;min-height:42px;display:flex;flex-direction:column;align-items:center;justify-content:center}
+td.x small{font-size:10.5px;font-weight:500;opacity:.85;margin-top:2px}
+td.x:hover,td.x.sel{box-shadow:inset 0 0 0 2px var(--acc)}
+td.x.ok{background:var(--g-bg);color:var(--g)}td.x.late{background:var(--o-bg);color:var(--o)}
+td.x.wait{background:var(--y-bg);color:var(--y)}td.x.error{background:var(--r-bg);color:var(--r)}
+td.x.missing>div{box-shadow:inset 0 0 0 1.5px var(--r);border-radius:6px;margin:3px;min-height:36px;color:var(--r)}
+td.x.pending>div{box-shadow:inset 0 0 0 1.5px var(--y);border-radius:6px;margin:3px;min-height:36px;color:var(--y)}
+td.x.na,td.x.never{color:var(--n);font-weight:500}td.x.never{opacity:.55}
+td.x.note{background:var(--n-bg);color:var(--ink);font-weight:500;white-space:normal}
+tr.gone td{opacity:.6}
+td.del{padding:0 4px}td.del button{border:0;background:none;color:var(--mut);cursor:pointer;font-size:16px;width:28px;height:28px;border-radius:50%}
+td.del button:hover{background:var(--r-bg);color:var(--r)}
+#menu{position:fixed;z-index:50;width:290px;max-width:calc(100vw - 16px);padding:12px;border-radius:16px;background:var(--dlg);
+border:1px solid var(--edge);box-shadow:0 20px 60px -15px var(--shadow)}
+#menu .mh{font-weight:600;margin-bottom:6px}
+#menu .info{margin:0 0 8px;padding:8px 10px;font-size:12px;max-height:190px;overflow:auto}
+#menu .opts{display:grid;grid-template-columns:1fr 1fr;gap:5px}
+#menu button{font:inherit;font-size:12.5px;font-weight:600;border:0;border-radius:10px;padding:7px 8px;cursor:pointer;
+background:var(--n-bg);color:var(--ink);text-align:left}
+#menu button:hover{background:var(--acc-soft);color:var(--acc)}
+#menu .ok{color:var(--g)}#menu .late{color:var(--o)}#menu .error{color:var(--r)}#menu .wait{color:var(--y)}
+#menu form{display:flex;gap:5px;margin:6px 0}#menu input{flex:1;min-width:0;font:inherit;font-size:13px;padding:7px 10px;
+border-radius:10px;border:1px solid var(--line);background:var(--field);color:var(--ink)}
+#menu .sep{font-size:11px;color:var(--mut);margin:8px 2px 4px;text-transform:uppercase;letter-spacing:.05em}
+.tabs{display:inline-flex;gap:4px;padding:4px;border-radius:999px;margin:28px 0 12px}
+.tab{font:inherit;font-weight:600;font-size:13px;border:0;border-radius:999px;padding:8px 16px;cursor:pointer;background:none;color:var(--mut)}
+.tab.on{background:var(--acc);color:#fff}
+.log td{font-size:12.5px}.log td.w{white-space:normal;min-width:220px}
+.dot{width:12px;height:12px;border-radius:4px;display:inline-block}
+.pill{display:inline-block;padding:2px 8px;border-radius:999px;font-size:11px;font-weight:600;background:var(--n-bg);color:var(--mut)}
+.flash{margin-top:18px;padding:12px 18px;font-weight:600}
+dialog{border:1px solid var(--edge);border-radius:22px;padding:24px;width:min(460px,calc(100vw - 32px));color:var(--ink);background:var(--dlg);
+box-shadow:0 30px 80px -20px var(--shadow)}
+dialog::backdrop{background:rgba(70,30,5,.25);backdrop-filter:blur(3px)}
+dialog h3{margin:0 0 4px;font-size:18px;font-weight:600}
+.info{margin:14px 0;padding:12px 14px;border-radius:14px;background:var(--n-bg);font-size:13px;white-space:pre-wrap}
+.acts{display:grid;grid-template-columns:1fr 1fr;gap:8px}.acts .btn{width:100%;text-align:center}
+.acts .full{grid-column:1/-1}
+dialog label{display:block;font-size:12px;color:var(--mut);font-weight:600;margin-bottom:10px}
+dialog input[type=text],dialog textarea{display:block;width:100%;margin-top:5px;font:inherit;color:var(--ink);padding:9px 12px;
+border-radius:12px;border:1px solid var(--line);background:var(--field)}
+dialog textarea{min-height:70px;resize:vertical}
+.taxpick{display:grid;grid-template-columns:1fr 1fr;gap:4px 12px;margin:6px 0 12px}
+.taxpick label{display:flex;gap:8px;align-items:center;margin:0;font-weight:500;color:var(--ink);font-size:13px}
+.close{display:flex;justify-content:flex-end;margin-top:14px}
+@media (max-width:640px){.wrap{padding:20px 16px 40px}h1{font-size:21px}.kpi b{font-size:24px}
+td.co,th.co{min-width:150px}td.x{min-width:92px}}
+"""
+
+MATRIX_JS = """
+const $=s=>document.querySelector(s),$$=s=>[...document.querySelectorAll(s)];
+const ss={get:k=>{try{return sessionStorage.getItem(k)}catch(e){return null}},set:(k,v)=>{try{sessionStorage.setItem(k,v)}catch(e){}}};
+const q=$('#q'),fs=$('#fstaff'),fm=$('#fmiss');
+function apply(){const t=(q.value||'').toLowerCase().trim(),s=fs.value,m=fm.checked;let n=0;
+ $$('#pane-sheet tbody tr').forEach(tr=>{const ok=(!t||tr.dataset.k.includes(t))&&(!s||tr.dataset.s===s)&&(!m||tr.dataset.m==='1');
+ tr.hidden=!ok;if(ok)n++});$('#shown').textContent=n;
+ $$('#pane-log tbody tr').forEach(tr=>{tr.hidden=!!t&&!tr.dataset.k.includes(t)});
+ $$('.st').forEach(c=>c.classList.toggle('on',!!s&&c.dataset.s===s));
+ ss.set('mx_q',q.value);ss.set('mx_s',s);ss.set('mx_m',m?'1':'');}
+q.value=ss.get('mx_q')||'';fs.value=ss.get('mx_s')||'';fm.checked=ss.get('mx_m')==='1';
+[q,fs,fm].forEach(el=>el.addEventListener('input',apply));apply();
+$$('.st').forEach(c=>c.onclick=()=>{fs.value=fs.value===c.dataset.s?'':c.dataset.s;apply()});
+$('#per').onchange=e=>location.href='/hisobotlar?p='+e.target.value;
+function showTab(t){$$('.tab').forEach(b=>b.classList.toggle('on',b.dataset.t===t));
+ $$('.pane').forEach(p=>p.hidden=p.id!=='pane-'+t);ss.set('mx_tab',t)}
+$$('.tab').forEach(b=>b.onclick=()=>showTab(b.dataset.t));showTab(ss.get('mx_tab')==='log'?'log':'sheet');
+async function api(data){
+ const r=await fetch('/dashboard/api/edit',{method:'POST',credentials:'same-origin',
+  headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams(Object.assign({csrf:CSRF,p:PERIOD},data))});
+ let j=null;try{j=await r.json()}catch(e){}
+ if(!j||!j.ok){alert((j&&j.error)||'Saqlanmadi — sessiya tugagan bo‘lishi mumkin. Sahifani yangilang.');throw new Error('save')}
+ return j}
+// Matnli kataklar: bosing — yozing — Enter (Esc — bekor)
+$$('td.ed').forEach(td=>{
+ td.onclick=()=>{if(td.isContentEditable)return;closeMenu();td.dataset.old=td.textContent;td.contentEditable='true';td.focus();
+  const r=document.createRange();r.selectNodeContents(td);const s=getSelection();s.removeAllRanges();s.addRange(r)};
+ td.onkeydown=e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();td.blur()}
+  if(e.key==='Escape'){td.textContent=td.dataset.old;td.blur()}};
+ td.onblur=async()=>{if(!td.isContentEditable)return;td.contentEditable='false';const v=td.textContent.trim();
+  if(v===(td.dataset.old||'').trim()){td.textContent=td.dataset.old;return}
+  try{const j=await api({kind:'co',inn:td.closest('tr').dataset.inn,field:td.dataset.f,v});td.textContent=j.text;
+   td.classList.add('saved');setTimeout(()=>td.classList.remove('saved'),1300)}catch(e){td.textContent=td.dataset.old}}});
+// Soliq kataklari: bosing — tafsilot va tanlov
+const menu=$('#menu');let cur=null;
+function closeMenu(){menu.hidden=true;if(cur)cur.classList.remove('sel');cur=null}
+$$('td.x').forEach(td=>td.onclick=e=>{e.stopPropagation();if(cur===td)return closeMenu();closeMenu();cur=td;td.classList.add('sel');
+ menu.querySelector('.mh').textContent=td.closest('tr').dataset.name+' · '+td.dataset.tn+' · '+PERIOD_LABEL;
+ const inf=menu.querySelector('.info');inf.textContent=td.dataset.info||'';inf.hidden=!td.dataset.info;
+ menu.querySelector('input').value='';menu.hidden=false;
+ const r=td.getBoundingClientRect(),w=menu.offsetWidth,h=menu.offsetHeight;
+ let x=Math.min(r.left,innerWidth-w-8),y=r.bottom+4;if(y+h>innerHeight-8)y=Math.max(8,r.top-h-4);
+ menu.style.left=Math.max(8,x)+'px';menu.style.top=y+'px'});
+document.addEventListener('click',e=>{if(!menu.hidden&&!menu.contains(e.target))closeMenu()});
+addEventListener('keydown',e=>{if(e.key==='Escape')closeMenu()});
+$$('.card').forEach(c=>c.addEventListener('scroll',closeMenu,{passive:true}));
+async function setCell(v){const td=cur;if(!td)return;const obl=v.startsWith('obl:');
+ try{const j=await api({kind:obl?'obl':'cell',inn:td.closest('tr').dataset.inn,tax:td.dataset.tax,v:obl?v.slice(4):v});
+  if(j.reload){location.reload();return}
+  td.className='x '+j.cls;td.innerHTML=j.html;td.dataset.info=j.info;td.title=j.info;closeMenu();
+  td.classList.add('saved');setTimeout(()=>td.classList.remove('saved'),1300)}catch(e){}}
+menu.querySelectorAll('[data-v]').forEach(b=>b.onclick=()=>setCell(b.dataset.v));
+menu.querySelector('form').onsubmit=e=>{e.preventDefault();const t=menu.querySelector('input').value.trim();if(t)setCell('t:'+t)};
+$('#addCo').onclick=()=>$('#dAdd').showModal();
+$$('[data-close]').forEach(b=>b.onclick=()=>b.closest('dialog').close());
+$$('form.hide').forEach(f=>f.onsubmit=()=>confirm('Korxona jadvaldan olib tashlansinmi? (tarixi saqlanadi)'));
+let lastAct=/[?&]auto=1/.test(location.search)?0:Date.now();
+['mousemove','mousedown','keydown','scroll','touchstart'].forEach(ev=>addEventListener(ev,()=>{lastAct=Date.now()},{passive:true}));
+setInterval(()=>{if(document.querySelector('dialog[open],[contenteditable=true]')||!menu.hidden||Date.now()-lastAct<110000)return;
+ location.replace('/hisobotlar?p='+PERIOD+'&auto=1&active=0')},120000);
+"""
+
+MX_FLASH = {"co_hidden": "✅ Korxona jadvaldan olib tashlandi", "co_add": "✅ Yangi mijoz qo'shildi",
+            "bad_inn": "⚠️ INN 9 yoki 14 raqam bo'lishi kerak", "stale": "⚠️ Sahifa eskirgan edi — yangilandi. Qayta urining."}
+WORDS = {"ok": "топширилган", "late": "кечикиб топширилган", "wait": "текширувда", "error": "хато", "na": "йук",
+         "missing": "топширилмаган", "pending": "кутилмоқда"}
+LOG_FIELDS = ["№ Отчета", "№ Пакет", "Наименование", "Год", "Период", "Дата отправки", "Состояние", "Причина ошибки",
+              "Дата проверки", "Инспектор", "Регион", "Сертификат", "Дата создания", "IP адрес"]
+CO_FIELDS = {"name": 120, "activity": 80, "staff": 80, "c1": 40, "note": 500}
+
+
+def cell_view(cell):
+    """Katak -> (css klass, ichki html, tafsilot matni). Matn Excel'dagi so'zlar bilan."""
+    st, src = cell["st"], cell.get("src")
+    det = {}
+    if src == "soliq":
+        try:
+            det = json.loads(cell.get("detail") or "{}")
+        except ValueError:
+            pass
+    rec = det.get("rec") or {k2: det.get(k1) for k1, k2 in (("form", "Наименование"), ("state", "Состояние"),
+                                                              ("sent", "Дата отправки"), ("err", "Причина ошибки"))}
+    small = ""
+    if src == "soliq":
+        small = (rec.get("Дата отправки") or "")[:5]
+        info = "\n".join(["Manba: soliq.uz (avtomatik)", f"Yuborgan hodim: {det.get('by') or '—'}"]
+                         + [f"{k}: {v}" for k, v in rec.items() if v])
+    elif src == "excel":
+        info = "Manba: eski Excel fayl" + (f"\nExcel'da: {cell.get('detail')}" if cell.get("detail") else "")
+    elif src == "manual":
+        small = "qo'lda"
+        info = f"Manba: dashboardda qo'lda belgilangan ({(cell.get('ts') or '')[:16].replace('T', ' ')})"
+    else:
+        info = ""
+    if st == "missing":
+        info = "Topshirilmagan — muddat o'tgan.\nBu korxona odatda shu hisobotni topshiradi."
+    elif st == "pending":
+        info = "Hali topshirilmagan, muddat o'tmagan."
+    if st == "note":
+        text = cell.get("detail") or ""
+    elif st is None:
+        text = "йук" if cell.get("never") else ""
+        info = "Belgilangan: bu korxona bu soliqni topshirmaydi" if cell.get("never") else ""
+    else:
+        text = WORDS.get(st, st)
+    cls = st or ("never" if cell.get("never") else "none")
+    html_ = f"<div>{esc(text)}{f'<small>{esc(small)}</small>' if small else ''}</div>"
+    return cls, html_, info
+
+
+def text_status(t):
+    s = t.lower().replace("ў", "у").replace("ё", "е")
+    if "кечик" in s:
+        return "late"
+    if "топширилмаган" in s:
+        return "note"
+    if "топшир" in s or "сдан" in s:
+        return "ok"
+    if s in ("йук", "йок", "нет", "-", "—", "х", "x", "yo'q", "yoq") or "шарт эмас" in s:
+        return "na"
+    if "хато" in s or "ошиб" in s:
+        return "error"
+    if "текшир" in s:
+        return "wait"
+    return "note"
+
+
+def all_periods():
+    ps = {r["period"] for r in q("SELECT DISTINCT period FROM filings")}
+    cur = default_period()
+    ps |= {period_shift(cur, i) for i in range(-3, 2)}
+    return sorted(ps, reverse=True)
+
+
+def period_reports(per):
+    """Shu davrga tegishli, bot qabul qilgan hamma hisobotlar (har biri oxirgi holati bilan)."""
+    latest = {}
+    for r in q("SELECT r.*, e.name ename FROM reports r LEFT JOIN employees e ON e.tg_id=r.tg_id ORDER BY r.ts"):
+        try:
+            d = json.loads(r["data"] or "{}")
+        except ValueError:
+            continue
+        if report_period(d, r["ts"]) == per:
+            latest[r["report_id"]] = (r, d)
+    return sorted(latest.values(), key=lambda x: x[0]["ts"], reverse=True)
+
+
+def render_matrix(per, flash=""):
+    m = period_matrix(per)
+    tot, by = matrix_counts(m)
+    pct = round(100 * tot["done"] / tot["need"]) if tot["need"] else None
+    opts = "".join(f'<option value="{p}"{" selected" if p == per else ""}>{period_label(p)}</option>' for p in all_periods())
+    staff_cards = "".join(
+        f'<div class="st glass" data-s="{esc(s)}"><div class="top"><span>{esc(s)}</span>'
+        f'<span class="mut">{v["done"]}/{v["need"]}</span></div>'
+        f'<div class="bar"><i style="width:{round(100 * v["done"] / v["need"]) if v["need"] else 0}%"></i></div>'
+        f'<div class="sub">{"qolgan " + str(v["missing"]) if v["missing"] else "hammasi topshirilgan ✓"}'
+        f'{" · xato/kech " + str(v["bad"]) if v["bad"] else ""}</div></div>' for s, v in sorted(by.items()) if v["need"])
+    head = "".join(f'<th title="{esc(n)}">{esc(x)}</th>' for _k, n, x in TAXES)
+    body = []
+    for i, r in enumerate(m["rows"], 1):
+        c = r["c"]
+        tds, miss = [], False
+        for k, n, _x in TAXES:
+            cell = r["cells"][k]
+            cls, inner, info = cell_view(cell)
+            miss = miss or cell["st"] in ("missing", "pending", "error")
+            tds.append(f'<td class="x {cls}" data-tax="{k}" data-tn="{esc(n)}" data-info="{esc(info)}" '
+                       f'title="{esc(info)}">{inner}</td>')
+        if m["other"]:
+            oth = "; ".join(f'{f["tax"][2:]} — {WORDS.get(f["status"], f["status"])}' for f in r["others"])
+            tds.append(f'<td class="ro" style="white-space:normal;min-width:180px">{esc(oth)}</td>')
+        staff_td = (f'<td class="ro" title="Botda biriktirilgan — Dashboard orqali o‘zgartiriladi">{esc(r["staff"])}</td>'
+                    if r["staff_is_bot"] else f'<td class="ed" data-f="staff">{esc(c.get("staff") or "")}</td>')
+        key = f'{c["name"] or ""} {c["inn"]} {c.get("activity") or ""} {r["staff"]} {c.get("note") or ""}'.lower()
+        gone = c.get("active", 1) not in (1, None)
+        body.append(
+            f'<tr{" class=gone" if gone else ""} data-k="{esc(key)}" data-s="{esc(r["staff"] or "—")}" '
+            f'data-m="{1 if miss else 0}" data-inn="{esc(c["inn"])}" data-name="{esc(c["name"] or c["inn"])}">'
+            f'<td class="n">{i}</td><td class="co ed" data-f="name">{esc(c["name"] or "")}</td>'
+            f'<td class="ed" data-f="activity">{esc(c.get("activity") or "")}</td><td class="ro">{esc(c["inn"])}</td>'
+            f'{staff_td}<td class="ed" data-f="c1">{esc(c.get("c1") or "")}</td>{"".join(tds)}'
+            f'<td class="ed" data-f="note" style="min-width:160px">{esc(c.get("note") or "")}</td>'
+            f'<td class="del"><form class="hide" method="post" action="/dashboard/company">'
+            f'<input type="hidden" name="inn" value="{esc(c["inn"])}"><input type="hidden" name="act" value="hide">'
+            f'<input type="hidden" name="p" value="{per}"><input type="hidden" name="csrf" value="{CSRF}">'
+            f'<button title="Jadvaldan olib tashlash" aria-label="Olib tashlash">×</button></form></td></tr>')
+    # Bot olgan barcha ma'lumotlar (shu davr)
+    reps = period_reports(per)
+    log_rows = []
+    for r, d in reps:
+        tax = tax_of(d.get("Наименование")) or ""
+        col = next((x for k, _n, x in TAXES if k == tax), "boshqa")
+        lvl = {"ok": "g", "late": "y", "error": "r"}.get(filing_status(d.get("Состояние"), d.get("Причина ошибки")), "y")
+        key = f'{r["company"] or ""} {r["inn"]} {r["ename"] or ""} {d.get("Наименование") or ""}'.lower()
+        vals = "".join(
+            f'<td{" class=w" if f in ("Наименование", "Причина ошибки") else ""}>'
+            + (f'<span class="pill {lvl}">{esc(str(d.get(f) or ""))}</span>' if f == "Состояние" else esc(str(d.get(f) or "")))
+            + "</td>" for f in LOG_FIELDS)
+        log_rows.append(f'<tr data-k="{esc(key)}"><td>{esc(r["ts"][:16].replace("T", " "))}</td>'
+                        f'<td class="w"><b>{esc(r["company"] or "")}</b></td><td>{esc(r["inn"])}</td>'
+                        f'<td>{esc(r["ename"] or "")}</td><td>{esc(col)}</td>{vals}</tr>')
+    log_head = "".join(f"<th class=l>{esc(f)}</th>" for f in LOG_FIELDS)
+    fl = f'<div class="flash glass">{esc(MX_FLASH[flash])}</div>' if flash in MX_FLASH else ""
+    staff_opts = "".join(f'<option value="{esc(s)}">{esc(s)}</option>' for s in sorted(by))
+    tax_checks = "".join(f'<label><input type="checkbox" name="tax" value="{k}"'
+                         f'{" checked" if k == "jshds" else ""}> {esc(x)}</label>' for k, _n, x in TAXES)
+    hidden = f'<input type="hidden" name="p" value="{per}"><input type="hidden" name="csrf" value="{CSRF}">'
+    due = period_due(per)
+    return f"""<!DOCTYPE html><html lang="uz"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Hisobotlar jadvali</title>
+<style>{MATRIX_CSS}</style></head><body><div class="wrap">
+<header><h1>Hisobotlar jadvali</h1>
+<div class="hright">
+<div class="pnav glass"><a href="/hisobotlar?p={period_shift(per, -1)}" title="Oldingi oy">‹</a>
+<select id="per" aria-label="Davr">{opts}</select>
+<a href="/hisobotlar?p={period_shift(per, 1)}" title="Keyingi oy">›</a></div>
+<a class="btn ghost" href="/hisobotlar.csv?p={per}">⬇ Excel</a>
+<button class="btn" id="addCo">+ Mijoz</button>
+<a class="btn ghost" href="/dashboard">Dashboard</a></div></header>
+{fl}
+<div class="kpis">
+<div class="kpi glass a"><span>Topshirilishi kerak</span><b>{tot['need']}</b></div>
+<div class="kpi glass g"><span>Topshirildi</span><b>{tot['done']}{f' <span class="sub">· {pct}%</span>' if pct is not None else ''}</b></div>
+<div class="kpi glass {'r' if m['overdue'] else 'o'}"><span>{'Qarz (muddat o‘tgan)' if m['overdue'] else 'Qolgan'}</span><b>{tot['missing']}</b></div>
+<div class="kpi glass o"><span>Xato yoki kech</span><b>{tot['bad']}</b></div>
+</div>
+<p class="sub" style="margin:10px 4px 0">{period_label(per)} davri hisobotlari · muddat taxminan {due:%d.%m.%Y} gacha ·
+hodimlar soliq.uz da “Отправить” bosgach katak o‘zi to‘ladi</p>
+<h2>Hodimlar bo‘yicha</h2>
+<div class="staff">{staff_cards or '<div class="sub">Ma’lumot yo‘q</div>'}</div>
+<div class="tabs glass"><button class="tab on" data-t="sheet">Jadval (Excel) · <span id="shown">{len(m['rows'])}</span></button>
+<button class="tab" data-t="log">Bot olgan ma’lumotlar · {len(reps)}</button></div>
+<div class="tools"><input type="search" id="q" placeholder="Qidirish: nom, INN, faoliyat, hodim, izoh…">
+<select id="fstaff"><option value="">Hamma hodimlar</option>{staff_opts}</select>
+<label><input type="checkbox" id="fmiss"> Faqat topshirilmaganlar</label></div>
+<div id="pane-sheet" class="pane">
+<p class="sub" style="margin:0 4px 10px">Matnli katakni bosing va yozing (Enter — saqlash, Esc — bekor).
+Soliq katagini bosing — soliq.uz dan kelgan hamma ma’lumot va o‘zgartirish. Yashil — topshirilgan, sariq — tekshiruvda,
+to‘q sariq — kech, qizil — xato, qizil ramka — qarz.</p>
+<div class="card glass"><table class="sheet"><thead><tr><th class="l">№</th><th class="co l">Наименование организации</th>
+<th class="l">Вид деятельности</th><th class="l">ИНН</th><th class="l">Ходимлар</th><th class="l">1C</th>{head}
+{'<th class="l">Бошқа ҳисоботлар</th>' if m['other'] else ''}<th class="l">Изоҳ</th><th></th></tr></thead>
+<tbody>{''.join(body) or '<tr><td colspan="22" class="mut">Korxonalar yo‘q — “+ Mijoz” tugmasini bosing</td></tr>'}</tbody></table></div>
+</div>
+<div id="pane-log" class="pane" hidden>
+<p class="sub" style="margin:0 4px 10px">{period_label(per)} davri uchun hodimlarning soliq.uz kabinetidan bot qabul qilgan
+hamma hisobotlar — har bir maydon bilan (oxirgi holati).</p>
+<div class="card glass"><table class="log"><thead><tr><th class="l">Bot qabul qildi</th><th class="l">Korxona</th><th class="l">ИНН</th>
+<th class="l">Yuborgan hodim</th><th class="l">Jadval ustuni</th>{log_head}</tr></thead>
+<tbody>{''.join(log_rows) or '<tr><td colspan="19" class="mut">Bu davr uchun hali hisobot kelmagan</td></tr>'}</tbody></table></div>
+<p style="margin-top:10px"><a class="btn ghost" href="/hisobotlar.csv?p={per}&amp;t=log">⬇ Bu ro‘yxatni Excel’ga</a></p>
+</div>
+</div>
+<div id="menu" hidden><div class="mh"></div><div class="info"></div>
+<div class="opts"><button data-v="ok" class="ok">топширилган</button><button data-v="na">йук</button>
+<button data-v="late" class="late">кечикиб топширилган</button><button data-v="wait" class="wait">текширувда</button>
+<button data-v="error" class="error">хато</button><button data-v="clear">↺ avtomatik / bo‘sh</button></div>
+<form><input placeholder="Boshqa matn yozing…" maxlength="120"><button>OK</button></form>
+<div class="sep">Bu korxona bu soliqni</div>
+<div class="opts"><button data-v="obl:req_m">har oy topshiradi</button><button data-v="obl:req_q">har chorakda</button>
+<button data-v="obl:never">umuman topshirmaydi</button></div></div>
+<dialog id="dAdd"><h3>Yangi mijoz</h3>
+<form method="post" action="/dashboard/company" style="margin-top:14px">{hidden}<input type="hidden" name="act" value="add">
+<label>INN<input type="text" name="inn" required pattern="[0-9]{{9}}|[0-9]{{14}}" inputmode="numeric" placeholder="309497371"></label>
+<label>Korxona nomi<input type="text" name="name" required maxlength="120" placeholder="UNI-TAX CONSULT"></label>
+<label>Faoliyat turi<input type="text" name="activity" maxlength="80" placeholder="Улгурчи савдо"></label>
+<label>Hodim<input type="text" name="staff" maxlength="80"></label>
+<div class="sub">Har oy topshiradigan hisobotlari:</div><div class="taxpick">{tax_checks}</div>
+<div class="acts"><button type="button" class="btn ghost" data-close>Bekor</button><button class="btn">Qo‘shish</button></div>
+</form></dialog>
+<script>const PERIOD="{per}",PERIOD_LABEL="{period_label(per)}",CSRF="{CSRF}";{MATRIX_JS}</script></body></html>"""
+
+
+def _csv_line(vals):
+    out = []
+    for v in vals:
+        v = str(v if v is not None else "")
+        out.append('"' + v.replace('"', '""') + '"' if any(ch in v for ch in ';"\n\r') else v)
+    return ";".join(out)
+
+
+def matrix_csv(per, kind=""):
+    """Jadval (yoki bot olgan hisobotlar ro'yxati) — Excel ochadigan CSV (UTF-8 BOM, ';')."""
+    if kind == "log":
+        lines = [_csv_line(["Bot qabul qildi", "Korxona", "ИНН", "Yuborgan hodim", "Jadval ustuni"] + LOG_FIELDS)]
+        for r, d in period_reports(per):
+            tax = tax_of(d.get("Наименование")) or ""
+            col = next((x for k, _n, x in TAXES if k == tax), "boshqa")
+            lines.append(_csv_line([r["ts"][:16].replace("T", " "), r["company"], r["inn"], r["ename"], col]
+                                   + [d.get(f) for f in LOG_FIELDS]))
+        return "﻿" + "\r\n".join(lines) + "\r\n"
+    m = period_matrix(per)
+    lines = [_csv_line(["№", "Наименование организации", "Вид деятельности", "ИНН", "Ходимлар", "1C"]
+                       + [x for _k, _n, x in TAXES] + ["Изоҳ"])]
+    for i, r in enumerate(m["rows"], 1):
+        c = r["c"]
+        vals = []
+        for k, _n, _x in TAXES:
+            ce = r["cells"][k]
+            vals.append(ce.get("detail") if ce["st"] == "note" else ("йук" if ce.get("never") else WORDS.get(ce["st"], "")))
+        lines.append(_csv_line([i, c["name"], c.get("activity"), c["inn"], r["staff"], c.get("c1")] + vals + [c.get("note")]))
+    return "﻿" + "\r\n".join(lines) + "\r\n"
+
+
+def matrix_api(f):
+    """Jadvalda joyida tahrirlash (fetch). -> JSON javob."""
+    inn = "".join(ch for ch in f.get("inn", "") if ch.isdigit())
+    per = f.get("p", "")
+    if len(inn) not in (9, 14) or not re.match(r"^\d{4}-(0[1-9]|1[0-2])$", per):
+        return {"ok": False, "error": "Noto'g'ri so'rov — sahifani yangilang"}
+    kind, v = f.get("kind", ""), f.get("v", "")
+    if kind == "co":
+        field = f.get("field", "")
+        if field not in CO_FIELDS:
+            return {"ok": False, "error": "Bu ustunni o'zgartirib bo'lmaydi"}
+        val = (v.strip() if field == "note" else " ".join(v.split()))[:CO_FIELDS[field]]
+        if field == "name" and not val:
+            return {"ok": False, "error": "Korxona nomi bo'sh bo'lmasin"}
+        if not q("SELECT 1 FROM companies WHERE inn=?", (inn,), one=True):
+            q("INSERT INTO companies(inn,name,tg_id) VALUES(?,'',NULL)", (inn,))
+        q(f"UPDATE companies SET {field}=? WHERE inn=?", (val, inn))
+        return {"ok": True, "text": val}
+    tax = f.get("tax", "")
+    if tax not in TAX_NAME:
+        return {"ok": False, "error": "Soliq turi noto'g'ri"}
+    if kind == "obl":
+        if v not in ("req_m", "req_q", "never"):
+            return {"ok": False, "error": "Noto'g'ri tanlov"}
+        q("INSERT OR REPLACE INTO obligations(inn,tax,required,freq,source) VALUES(?,?,?,?,'manual')",
+          (inn, tax, 0 if v == "never" else 1, "q" if v == "req_q" else "m"))
+        return {"ok": True, "reload": True}
+    if kind != "cell":
+        return {"ok": False, "error": "Noto'g'ri so'rov"}
+    ts = now().isoformat()
+    text = " ".join(v[2:].split())[:120] if v.startswith("t:") else ""
+    if v in WORDS and v not in ("missing", "pending"):
+        q("INSERT OR REPLACE INTO filings(inn,period,tax,status,source,report_id,detail,ts) "
+          "VALUES(?,?,?,?,'manual',NULL,NULL,?)", (inn, per, tax, v, ts))
+    elif v == "clear" or (v.startswith("t:") and not text):
+        q("DELETE FROM filings WHERE inn=? AND period=? AND tax=? AND source!='soliq'", (inn, per, tax))
+        backfill_filings(inn)   # qo'lda belgi olib tashlansa — soliq.uz dagi holat qaytadi
+    elif text:
+        st = text_status(text)
+        q("INSERT OR REPLACE INTO filings(inn,period,tax,status,source,report_id,detail,ts) "
+          "VALUES(?,?,?,?,'manual',NULL,?,?)", (inn, per, tax, st, text if st == "note" else None, ts))
+    else:
+        return {"ok": False, "error": "Noto'g'ri tanlov"}
+    cls, inner, info = cell_view(one_cell(inn, per, tax))
+    return {"ok": True, "cls": cls, "html": inner, "info": info}
+
+
+def matrix_post(path, f, fl):
+    """Hisobotlar jadvali formalari (yangi mijoz, olib tashlash). -> flash kodi."""
+    inn = "".join(ch for ch in f.get("inn", "") if ch.isdigit())
+    if len(inn) not in (9, 14):
+        return "bad_inn"
+    act = f.get("act", "")
+    clip = lambda k, n: " ".join(f.get(k, "").split())[:n]
+    if act == "hide":
+        q("UPDATE companies SET active=0 WHERE inn=?", (inn,))
+        return "co_hidden"
+    if act == "add":
+        q("INSERT INTO companies(inn,name,tg_id,activity,staff,active,sort) VALUES(?,?,NULL,?,?,1,"
+          "(SELECT COALESCE(MAX(sort),0)+1 FROM companies)) ON CONFLICT(inn) DO UPDATE SET active=1, "
+          "name=COALESCE(NULLIF(excluded.name,''),companies.name), activity=excluded.activity, staff=excluded.staff",
+          (inn, clip("name", 120), clip("activity", 80), clip("staff", 80)))
+        for t in fl.get("tax", []):
+            if t in TAX_NAME:
+                q("INSERT OR REPLACE INTO obligations(inn,tax,required,freq,source) VALUES(?,?,1,'m','manual')", (inn, t))
+        return "co_add"
+    return "stale"
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
@@ -1451,14 +2204,29 @@ class Handler(BaseHTTPRequestHandler):
         self._go("/dashboard", f"{SESSION_COOKIE}={token}; Path=/; HttpOnly; Secure; SameSite=Strict")
 
     def _dashboard_post(self, raw):
-        if not self._session(touch=True):
-            return self._go("/login?e=expired")
-        fl = urllib.parse.parse_qs(raw.decode("utf-8", "replace"))
-        f = {k: v[0] for k, v in fl.items()}
         path = self.path.split("?")[0]
+        is_api = path == "/dashboard/api/edit"
+        if not self._session(touch=True):
+            if is_api:
+                return self._out(401, {"ok": False, "error": "Sessiya tugagan — sahifani yangilab, qayta kiring"})
+            return self._go("/login?e=expired")
+        fl = urllib.parse.parse_qs(raw.decode("utf-8", "replace"), keep_blank_values=True)
+        f = {k: v[0] for k, v in fl.items()}
         log("DASHBOARD", path, {k: v for k, v in f.items() if k != "csrf"})
         if not secrets.compare_digest(f.get("csrf", ""), CSRF):
+            if is_api:
+                return self._out(403, {"ok": False, "error": "Sahifa eskirgan — yangilang (F5)"})
             return self._redirect("stale")
+        if is_api:
+            try:
+                return self._out(200, matrix_api(f))
+            except Exception:
+                log("API EDIT ERROR", traceback.format_exc())
+                return self._out(500, {"ok": False, "error": "Server xatosi — qayta urining"})
+        if path == "/dashboard/company":
+            per = f.get("p", "")
+            per = per if re.match(r"^\d{4}-(0[1-9]|1[0-2])$", per) else default_period()
+            return self._go(f"/hisobotlar?p={per}&m={matrix_post(path, f, fl)}")
         if path == "/dashboard/add_employee":
             uid, name = f.get("tg_id", "").strip(), " ".join(f.get("name", "").split())[:80]
             if not uid.isdigit():
@@ -1560,7 +2328,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/logout":
             session_end(self._cookie())
             return self._go("/login?e=out", f"{SESSION_COOKIE}=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict")
-        if path not in ("/", "/dashboard"):
+        if path not in ("/", "/dashboard", "/hisobotlar", "/hisobotlar.csv"):
             return self._out(404, "not found", "text/plain")
         # Avto-yangilanish (har daqiqa) faollik hisoblanmaydi — faqat foydalanuvchi sahifada nimadir qilgan bo'lsa.
         auto = qs.get("auto", [""])[0] == "1"
@@ -1568,12 +2336,22 @@ class Handler(BaseHTTPRequestHandler):
         exp = self._session(touch=(not auto) or active)
         if not exp:
             return self._go("/login?e=expired" if self._cookie() else "/login")
+        if path in ("/hisobotlar", "/hisobotlar.csv"):
+            per = qs.get("p", [""])[0]
+            per = per if re.match(r"^\d{4}-(0[1-9]|1[0-2])$", per) else default_period()
+            if path.endswith(".csv"):
+                kind = "log" if qs.get("t", [""])[0] == "log" else ""
+                return self._out(200, matrix_csv(per, kind), "text/csv; charset=utf-8",
+                                 {"Content-Disposition": f'attachment; filename="hisobotlar-{kind or "jadval"}-{per}.csv"',
+                                  "Cache-Control": "no-store"})
+            return self._out(200, render_matrix(per, qs.get("m", [""])[0]), "text/html; charset=utf-8")
         self._out(200, render_dashboard(qs.get("m", [""])[0]), "text/html; charset=utf-8")
 
 
 def main():
     if not DASH_PASSWORD:
         print("⚠️  config.json: DASHBOARD_PASSWORD bo'sh — dashboard ochilmaydi.")
+    backfill_filings()
     # Serverda "BIND": "127.0.0.1" — dashboardga faqat tunnel orqali kiriladi
     server = ThreadingHTTPServer((CFG.get("BIND", "0.0.0.0"), PORT), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
