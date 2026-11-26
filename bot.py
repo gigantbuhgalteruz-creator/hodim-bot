@@ -2864,6 +2864,9 @@ class Handler(BaseHTTPRequestHandler):
             if len(inn) in (9, 14) and g:
                 q("UPDATE companies SET rating=?, rating_ts=? WHERE inn=? AND COALESCE(active,1)=1",
                   (f"{g} - {num.group(0)}" if num else g, now().isoformat(), inn))
+            pr = body.get("probe")
+            if isinstance(pr, dict):               # reyting API sinovi natijasi (skriptdan)
+                log("RATING PROBE", json.dumps({k: str(v)[:1500] for k, v in pr.items()}, ensure_ascii=False))
             eps = body.get("endpoints")
             if isinstance(eps, list) and eps:      # yangi kabinet API manzillari (reytingni avtomatlashtirish uchun)
                 log("RATING ENDPOINTS", json.dumps([str(x)[:150] for x in eps[:60]], ensure_ascii=False))

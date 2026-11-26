@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Soliq.uz → Hodim bot: hisobotlar
 // @namespace    soliq-telegram
-// @version      4.2
+// @version      4.4
 // @description  Hodim soliq.uz kabinetida ishlayotganda hisobotlar jurnalini fonda tekshiradi va yangi/o'zgargan hisobotlarni bot serveriga yuboradi (bot ularni faqat ownerga jo'natadi).
 // @match        https://oldmy.soliq.uz/*
 // @match        https://my.soliq.uz/*
@@ -159,13 +159,7 @@
     for (const [inn, rating] of Object.entries(found)) {
       if (sentRating[inn] === rating) continue;
       sentRating[inn] = rating;
-      // Diagnostika (bir martalik): yangi kabinet reytingni qaysi ichki manzildan olayotganini bilish uchun
-      // sahifa so'ragan API manzillari (faqat yo'li, parametrlarisiz) — keyin reytingni eski kabinetdan olishga kerak.
-      const endpoints = onNew ? [...new Set(performance.getEntriesByType('resource')
-        .filter(r => /fetch|xmlhttprequest/.test(r.initiatorType))
-        .map(r => { try { const u = new URL(r.name); return u.host + u.pathname; } catch (e) { return ''; } })
-        .filter(Boolean))].slice(0, 60) : [];
-      post('/api/rating', { inn, rating, endpoints })
+      post('/api/rating', { inn, rating })
         .then(() => { ratingDiag += ' · serverga yuborildi ✔'; })
         .catch(e => { delete sentRating[inn]; ratingDiag += ' · yuborishda xato: ' + e.message; });
     }
@@ -176,6 +170,9 @@
   });
   setTimeout(ratingTick, 3000);
   setInterval(ratingTick, 15000);
+
+  // (4.3 da sinaldi: yangi kabinet API si alohida kirish tokenini talab qiladi va faqat o'sha paytda kirilgan
+  //  korxonaning reytingini beradi — eski kabinetdan avtomatik olib bo'lmaydi. Reyting sahifadan o'qiladi.)
   if (onNew) return;    // yangi kabinetda boshqa ish yo'q
 
   if (!KEY) askKey();   // serverUrl/post e'lon qilingandan keyin
