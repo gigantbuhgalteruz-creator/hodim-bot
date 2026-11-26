@@ -1,11 +1,7 @@
 tunnel: <TUNNEL_ID>
 credentials-file: /etc/cloudflared/hodim-panel.json
 ingress:
-  - hostname: panel.gigantbuxgalter.com
-    service: http://localhost:8080
-  # Hozircha asosiy domen ham dashboardni ochadi (keyin bu yerga firma sayti qo'yiladi)
+  # Yagona manzil: https://gigantbuxgalter.com (panel. va www. yopilgan)
   - hostname: gigantbuxgalter.com
-    service: http://localhost:8080
-  - hostname: www.gigantbuxgalter.com
     service: http://localhost:8080
   - service: http_status:404

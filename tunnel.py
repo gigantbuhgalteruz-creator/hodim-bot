@@ -84,7 +84,7 @@ def run_once():
     for line in p.stdout:
         print(line, end="")
         m = URL_RE.search(line)
-        if m and not sent and load_cfg().get("PUBLIC_URL", "").endswith(".gigantbuxgalter.com"):
+        if m and not sent and "gigantbuxgalter.com" in load_cfg().get("PUBLIC_URL", ""):
             # Doimiy domen (panel.gigantbuxgalter.com) ishlayapti — bu vaqtinchalik tunnel faqat eski
             # agent/skriptlar uchun zaxira; asosiy manzil o'zgartirilmaydi, xabar yuborilmaydi.
             print(f"\n==> Zaxira tunnel: {m.group(0)} (asosiy manzil doimiy domen)\n")

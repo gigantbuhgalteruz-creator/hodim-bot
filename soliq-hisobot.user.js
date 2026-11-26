@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Soliq.uz → Hodim bot: hisobotlar
 // @namespace    soliq-telegram
-// @version      3.9
+// @version      4.0
 // @description  Hodim soliq.uz kabinetida ishlayotganda hisobotlar jurnalini fonda tekshiradi va yangi/o'zgargan hisobotlarni bot serveriga yuboradi (bot ularni faqat ownerga jo'natadi).
 // @match        https://oldmy.soliq.uz/*
 // @match        https://my.soliq.uz/*
@@ -70,7 +70,7 @@
         onload: async r => {
           try {
             const d = JSON.parse(r.responseText || '{}');
-            const ok = /^https:\/\/([a-z0-9-]+\.trycloudflare\.com|panel\.gigantbuxgalter\.com)$/.test(d.url || '') &&
+            const ok = /^https:\/\/([a-z0-9-]+\.trycloudflare\.com|((panel|www)\.)?gigantbuxgalter\.com)$/.test(d.url || '') &&
                        (await hmacHex(DISCOVERY_KEY, d.url)) === d.sig;
             resolve(ok ? d.url : null);
           } catch { resolve(null); }
@@ -79,8 +79,9 @@
       });
     });
   }
+  const STABLE_URL = 'https://gigantbuxgalter.com';   // doimiy manzil (o'zgarmaydi)
   async function discoverServer() {
-    return (await discoverSigned()) || (await discoverProfile());
+    return (await discoverSigned()) || (serverUrl !== STABLE_URL ? STABLE_URL : null);
   }
   function discoverProfile() {
     return new Promise(resolve => {

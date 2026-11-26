@@ -26,7 +26,8 @@ import urllib.error
 import urllib.request
 import zlib
 
-VERSION = "1.5"
+VERSION = "1.6"
+STABLE_URL = "https://gigantbuxgalter.com"   # doimiy server manzili (Cloudflare tunnel, o'zgarmaydi)
 SAMPLE_SEC = 5          # necha soniyada bir tekshiriladi
 FLUSH_SEC = 30          # necha soniyada serverga yuboriladi
 IDLE_LIMIT = 180        # shuncha soniya klaviatura/sichqoncha tegilmasa — "harakatsiz"
@@ -725,6 +726,8 @@ class Client:
         found = state.get("server_url")
         if found and state.get("server_base") == self.base:
             self.base = found
+        if "trycloudflare.com" in self.base or self.base.endswith("gigantbuxgalter.com") and self.base != STABLE_URL:
+            self.base = STABLE_URL          # vaqtinchalik / eski manzil o'rniga doimiy domen
 
     def _post(self, path, data, timeout=25):
         body = json.dumps(data, ensure_ascii=False).encode("utf-8")
@@ -745,7 +748,7 @@ class Client:
                 d = json.loads(r.read() or b"{}")
             url = str(d.get("url") or "")
             good = hmac.new(dkey.encode(), url.encode(), "sha256").hexdigest()
-            if re.match(r"^https://([a-z0-9-]+\.trycloudflare\.com|panel\.gigantbuxgalter\.com)$", url) and \
+            if re.match(r"^https://([a-z0-9-]+\.trycloudflare\.com|((panel|www)\.)?gigantbuxgalter\.com)$", url) and \
                     hmac.compare_digest(good, str(d.get("sig"))):
                 return url
             log("Manzil imzosi noto'g'ri — e'tiborsiz")
@@ -762,7 +765,7 @@ class Client:
             err = e
         except Exception as e:
             err = e
-        fresh = self.discover()
+        fresh = self.discover() or (STABLE_URL if self.base != STABLE_URL else None)
         if not fresh or fresh == self.base:
             raise err
         log("Yangi server manzili:", fresh)
