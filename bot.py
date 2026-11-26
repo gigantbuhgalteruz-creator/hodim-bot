@@ -134,6 +134,7 @@ CREATE TABLE IF NOT EXISTS obligations(
   inn TEXT, tax TEXT, required INTEGER, freq TEXT DEFAULT 'm', source TEXT DEFAULT 'manual', PRIMARY KEY(inn, tax));
 """)
 for _col, _typ in (("activity", "TEXT"), ("staff", "TEXT"), ("c1", "TEXT"), ("note", "TEXT"),
+                   ("regime", "TEXT"), ("perk", "TEXT"),
                    ("sort", "INTEGER"), ("active", "INTEGER DEFAULT 1")):
     if _col not in {r[1] for r in db.execute("PRAGMA table_info(companies)")}:
         db.execute(f"ALTER TABLE companies ADD COLUMN {_col} {_typ}")
@@ -1727,16 +1728,24 @@ td.x.note{background:var(--n-bg);color:var(--ink);font-weight:500;white-space:no
 tr.gone td{opacity:.6}
 td.del{padding:0 4px}td.del button{border:0;background:none;color:var(--mut);cursor:pointer;font-size:16px;width:28px;height:28px;border-radius:50%}
 td.del button:hover{background:var(--r-bg);color:var(--r)}
-#menu{position:fixed;z-index:50;width:290px;max-width:calc(100vw - 16px);padding:12px;border-radius:16px;background:var(--dlg);
+#menu,#pick{position:fixed;z-index:50;width:290px;max-width:calc(100vw - 16px);padding:12px;border-radius:16px;background:var(--dlg);
 border:1px solid var(--edge);box-shadow:0 20px 60px -15px var(--shadow)}
-#menu .mh{font-weight:600;margin-bottom:6px}
+#pick{width:240px}#pick .opts{grid-template-columns:1fr}
+#menu .mh,#pick .mh{font-weight:600;margin-bottom:6px}
 #menu .info{margin:0 0 8px;padding:8px 10px;font-size:12px;max-height:190px;overflow:auto}
-#menu .opts{display:grid;grid-template-columns:1fr 1fr;gap:5px}
-#menu button{font:inherit;font-size:12.5px;font-weight:600;border:0;border-radius:10px;padding:7px 8px;cursor:pointer;
+#menu .opts,#pick .opts{display:grid;grid-template-columns:1fr 1fr;gap:5px;max-height:300px;overflow:auto}
+#pick .opts{grid-template-columns:1fr}
+#menu button,#pick button{font:inherit;font-size:12.5px;font-weight:600;border:0;border-radius:10px;padding:7px 8px;cursor:pointer;
 background:var(--n-bg);color:var(--ink);text-align:left}
-#menu button:hover{background:var(--acc-soft);color:var(--acc)}
+#menu button:hover,#pick button:hover{background:var(--acc-soft);color:var(--acc)}
+#pick button.on{background:var(--acc);color:#fff}
 #menu .ok{color:var(--g)}#menu .late{color:var(--o)}#menu .error{color:var(--r)}#menu .wait{color:var(--y)}
-#menu form{display:flex;gap:5px;margin:6px 0}#menu input{flex:1;min-width:0;font:inherit;font-size:13px;padding:7px 10px;
+td.pk{cursor:pointer;min-width:96px;font-size:13px;white-space:normal}
+td.pk::after{content:" ▾";color:var(--mut);font-size:10px}
+td.pk:hover,td.pk.sel{box-shadow:inset 0 0 0 2px var(--acc)}
+dialog select{display:block;width:100%;margin-top:5px;font:inherit;color:var(--ink);padding:9px 12px;
+border-radius:12px;border:1px solid var(--line);background:var(--field)}
+#menu form,#pick form{display:flex;gap:5px;margin:6px 0}#menu input,#pick input{flex:1;min-width:0;font:inherit;font-size:13px;padding:7px 10px;
 border-radius:10px;border:1px solid var(--line);background:var(--field);color:var(--ink)}
 #menu .sep{font-size:11px;color:var(--mut);margin:8px 2px 4px;text-transform:uppercase;letter-spacing:.05em}
 .tabs{display:inline-flex;gap:4px;padding:4px;border-radius:999px;margin:28px 0 12px}
@@ -1817,12 +1826,35 @@ async function setCell(v){const td=cur;if(!td)return;const obl=v.startsWith('obl
   td.classList.add('saved');setTimeout(()=>td.classList.remove('saved'),1300)}catch(e){}}
 menu.querySelectorAll('[data-v]').forEach(b=>b.onclick=()=>setCell(b.dataset.v));
 menu.querySelector('form').onsubmit=e=>{e.preventDefault();const t=menu.querySelector('input').value.trim();if(t)setCell('t:'+t)};
+// Ro'yxatdan tanlash: Ходимлар (bot hodimlari), Солиқ режими, Период
+const pick=$('#pick');let pcur=null;
+const PT={staff:'Ходимлар',regime:'Солиқ режими',perk:'Период'};
+function closePick(){pick.hidden=true;if(pcur)pcur.classList.remove('sel');pcur=null}
+async function setPick(v){const td=pcur;if(!td)return;const f=td.dataset.f;
+ try{const j=await api(f==='staff'?{kind:'staff',inn:td.closest('tr').dataset.inn,v}:{kind:'co',inn:td.closest('tr').dataset.inn,field:f,v});
+  if(j.reload){location.reload();return}
+  td.textContent=j.text;td.dataset.v=j.text;closePick();td.classList.add('saved');setTimeout(()=>td.classList.remove('saved'),1300)}catch(e){}}
+$$('td.pk').forEach(td=>td.onclick=e=>{e.stopPropagation();if(pcur===td)return closePick();closePick();closeMenu();pcur=td;td.classList.add('sel');
+ const f=td.dataset.f;pick.querySelector('.mh').textContent=td.closest('tr').dataset.name+' · '+PT[f];
+ const box=pick.querySelector('.opts');box.innerHTML='';
+ (PICKS[f]||[]).forEach(([v,t])=>{const b=document.createElement('button');b.type='button';b.textContent=t;
+  if(v===td.dataset.v&&v!=='')b.className='on';b.onclick=()=>setPick(v);box.appendChild(b)});
+ if(f==='staff'&&PICKS.staff.length<2){const s=document.createElement('div');s.className='sub';
+  s.textContent='Botda hali hodim yo‘q — avval hodim qo‘shing.';box.prepend(s)}
+ const fm=pick.querySelector('form');fm.hidden=f==='staff';fm.querySelector('input').value='';pick.hidden=false;
+ const r=td.getBoundingClientRect(),w=pick.offsetWidth,h=pick.offsetHeight;
+ let x=Math.min(r.left,innerWidth-w-8),y=r.bottom+4;if(y+h>innerHeight-8)y=Math.max(8,r.top-h-4);
+ pick.style.left=Math.max(8,x)+'px';pick.style.top=y+'px'});
+pick.querySelector('form').onsubmit=e=>{e.preventDefault();const t=pick.querySelector('input').value.trim();if(t)setPick(t)};
+document.addEventListener('click',e=>{if(!pick.hidden&&!pick.contains(e.target))closePick()});
+addEventListener('keydown',e=>{if(e.key==='Escape')closePick()});
+$$('.card').forEach(c=>c.addEventListener('scroll',closePick,{passive:true}));
 $('#addCo').onclick=()=>$('#dAdd').showModal();
 $$('[data-close]').forEach(b=>b.onclick=()=>b.closest('dialog').close());
 $$('form.hide').forEach(f=>f.onsubmit=()=>confirm('Korxona jadvaldan olib tashlansinmi? (tarixi saqlanadi)'));
 let lastAct=/[?&]auto=1/.test(location.search)?0:Date.now();
 ['mousemove','mousedown','keydown','scroll','touchstart'].forEach(ev=>addEventListener(ev,()=>{lastAct=Date.now()},{passive:true}));
-setInterval(()=>{if(document.querySelector('dialog[open],[contenteditable=true]')||!menu.hidden||Date.now()-lastAct<110000)return;
+setInterval(()=>{if(document.querySelector('dialog[open],[contenteditable=true]')||!menu.hidden||!pick.hidden||Date.now()-lastAct<110000)return;
  location.replace('/hisobotlar?p='+PERIOD+'&auto=1&active=0')},120000);
 """
 
@@ -1832,7 +1864,10 @@ WORDS = {"ok": "топширилган", "late": "кечикиб топшири�
          "missing": "топширилмаган", "pending": "кутилмоқда"}
 LOG_FIELDS = ["№ Отчета", "№ Пакет", "Наименование", "Год", "Период", "Дата отправки", "Состояние", "Причина ошибки",
               "Дата проверки", "Инспектор", "Регион", "Сертификат", "Дата создания", "IP адрес"]
-CO_FIELDS = {"name": 120, "activity": 80, "staff": 80, "c1": 40, "note": 500}
+CO_FIELDS = {"name": 120, "activity": 80, "staff": 80, "c1": 40, "note": 500, "regime": 40, "perk": 40}
+# Ro'yxatdan tanlanadigan ustunlar (Excel'dagi "Солик режими" va "Период"); "boshqa" matn ham yozish mumkin.
+REGIMES = ["Айланма", "НДС", "ЯТТ", "Фикс"]
+PERKS = ["Ойлик", "Чораклик", "Йиллик"]
 
 
 def cell_view(cell):
@@ -1936,8 +1971,10 @@ def render_matrix(per, flash=""):
         if m["other"]:
             oth = "; ".join(f'{f["tax"][2:]} — {WORDS.get(f["status"], f["status"])}' for f in r["others"])
             tds.append(f'<td class="ro" style="white-space:normal;min-width:180px">{esc(oth)}</td>')
-        staff_td = (f'<td class="ro" title="Botda biriktirilgan — Dashboard orqali o‘zgartiriladi">{esc(r["staff"])}</td>'
-                    if r["staff_is_bot"] else f'<td class="ed" data-f="staff">{esc(c.get("staff") or "")}</td>')
+        staff_td = (f'<td class="pk" data-f="staff" data-v="{r["resp"] or ""}" title="Bosing — hodimni tanlang">'
+                    f'{esc(r["staff"])}</td>')
+        rp_td = (f'<td class="pk" data-f="regime" data-v="{esc(c.get("regime") or "")}">{esc(c.get("regime") or "")}</td>'
+                    f'<td class="pk" data-f="perk" data-v="{esc(c.get("perk") or "")}">{esc(c.get("perk") or "")}</td>')
         key = f'{c["name"] or ""} {c["inn"]} {c.get("activity") or ""} {r["staff"]} {c.get("note") or ""}'.lower()
         gone = c.get("active", 1) not in (1, None)
         body.append(
@@ -1945,7 +1982,7 @@ def render_matrix(per, flash=""):
             f'data-m="{1 if miss else 0}" data-inn="{esc(c["inn"])}" data-name="{esc(c["name"] or c["inn"])}">'
             f'<td class="n">{i}</td><td class="co ed" data-f="name">{esc(c["name"] or "")}</td>'
             f'<td class="ed" data-f="activity">{esc(c.get("activity") or "")}</td><td class="ro">{esc(c["inn"])}</td>'
-            f'{staff_td}<td class="ed" data-f="c1">{esc(c.get("c1") or "")}</td>{"".join(tds)}'
+            f'{staff_td}<td class="ed" data-f="c1">{esc(c.get("c1") or "")}</td>{rp_td}{"".join(tds)}'
             f'<td class="ed" data-f="note" style="min-width:160px">{esc(c.get("note") or "")}</td>'
             f'<td class="del"><form class="hide" method="post" action="/dashboard/company">'
             f'<input type="hidden" name="inn" value="{esc(c["inn"])}"><input type="hidden" name="act" value="hide">'
@@ -1973,6 +2010,14 @@ def render_matrix(per, flash=""):
                          f'{" checked" if k == "jshds" else ""}> {esc(x)}</label>' for k, _n, x in TAXES)
     hidden = f'<input type="hidden" name="p" value="{per}"><input type="hidden" name="csrf" value="{CSRF}">'
     due = period_due(per)
+    emps = [(str(e_["tg_id"]), e_["name"]) for e_ in active_employees()]
+    picks = {"staff": emps + [("", "— biriktirilmagan")],
+             "regime": [(x, x) for x in REGIMES] + [("", "— bo‘sh")],
+             "perk": [(x, x) for x in PERKS] + [("", "— bo‘sh")]}
+    picks_js = json.dumps(picks).replace("<", "\\u003c")
+    emp_opts = "".join(f'<option value="{u}">{esc(n)}</option>' for u, n in emps)
+    reg_opts = "".join(f'<option>{esc(x)}</option>' for x in REGIMES)
+    perk_opts = "".join(f'<option>{esc(x)}</option>' for x in PERKS)
     return f"""<!DOCTYPE html><html lang="uz"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>Hisobotlar jadvali</title>
 <style>{MATRIX_CSS}</style></head><body><div class="wrap">
@@ -2005,9 +2050,10 @@ hodimlar soliq.uz da “Отправить” bosgach katak o‘zi to‘ladi</p>
 Soliq katagini bosing — soliq.uz dan kelgan hamma ma’lumot va o‘zgartirish. Yashil — topshirilgan, sariq — tekshiruvda,
 to‘q sariq — kech, qizil — xato, qizil ramka — qarz.</p>
 <div class="card glass"><table class="sheet"><thead><tr><th class="l">№</th><th class="co l">Наименование организации</th>
-<th class="l">Вид деятельности</th><th class="l">ИНН</th><th class="l">Ходимлар</th><th class="l">1C</th>{head}
+<th class="l">Вид деятельности</th><th class="l">ИНН</th><th class="l">Ходимлар</th><th class="l">1C</th>
+<th class="l">Солиқ режими</th><th class="l">Период</th>{head}
 {'<th class="l">Бошқа ҳисоботлар</th>' if m['other'] else ''}<th class="l">Изоҳ</th><th></th></tr></thead>
-<tbody>{''.join(body) or '<tr><td colspan="22" class="mut">Korxonalar yo‘q — “+ Mijoz” tugmasini bosing</td></tr>'}</tbody></table></div>
+<tbody>{''.join(body) or '<tr><td colspan="24" class="mut">Korxonalar yo‘q — “+ Mijoz” tugmasini bosing</td></tr>'}</tbody></table></div>
 </div>
 <div id="pane-log" class="pane" hidden>
 <p class="sub" style="margin:0 4px 10px">{period_label(per)} davri uchun hodimlarning soliq.uz kabinetidan bot qabul qilgan
@@ -2026,16 +2072,21 @@ hamma hisobotlar — har bir maydon bilan (oxirgi holati).</p>
 <div class="sep">Bu korxona bu soliqni</div>
 <div class="opts"><button data-v="obl:req_m">har oy topshiradi</button><button data-v="obl:req_q">har chorakda</button>
 <button data-v="obl:never">umuman topshirmaydi</button></div></div>
+<div id="pick" hidden><div class="mh"></div><div class="opts"></div>
+<form><input placeholder="Boshqa matn yozing…" maxlength="40"><button>OK</button></form></div>
 <dialog id="dAdd"><h3>Yangi mijoz</h3>
 <form method="post" action="/dashboard/company" style="margin-top:14px">{hidden}<input type="hidden" name="act" value="add">
 <label>INN<input type="text" name="inn" required pattern="[0-9]{{9}}|[0-9]{{14}}" inputmode="numeric" placeholder="309497371"></label>
 <label>Korxona nomi<input type="text" name="name" required maxlength="120" placeholder="UNI-TAX CONSULT"></label>
 <label>Faoliyat turi<input type="text" name="activity" maxlength="80" placeholder="Улгурчи савдо"></label>
-<label>Hodim<input type="text" name="staff" maxlength="80"></label>
+<label>Hodim<select name="uid"><option value="">— biriktirilmagan</option>{emp_opts}</select></label>
+<label>Солиқ режими<input type="text" name="regime" maxlength="40" list="dlReg" placeholder="Айланма"></label>
+<label>Период<select name="perk"><option value=""></option>{perk_opts}</select></label>
+<datalist id="dlReg">{reg_opts}</datalist>
 <div class="sub">Har oy topshiradigan hisobotlari:</div><div class="taxpick">{tax_checks}</div>
 <div class="acts"><button type="button" class="btn ghost" data-close>Bekor</button><button class="btn">Qo‘shish</button></div>
 </form></dialog>
-<script>const PERIOD="{per}",PERIOD_LABEL="{period_label(per)}",CSRF="{CSRF}";{MATRIX_JS}</script></body></html>"""
+<script>const PERIOD="{per}",PERIOD_LABEL="{period_label(per)}",CSRF="{CSRF}",PICKS={picks_js};{MATRIX_JS}</script></body></html>"""
 
 
 def _csv_line(vals):
@@ -2057,7 +2108,7 @@ def matrix_csv(per, kind=""):
                                    + [d.get(f) for f in LOG_FIELDS]))
         return "﻿" + "\r\n".join(lines) + "\r\n"
     m = period_matrix(per)
-    lines = [_csv_line(["№", "Наименование организации", "Вид деятельности", "ИНН", "Ходимлар", "1C"]
+    lines = [_csv_line(["№", "Наименование организации", "Вид деятельности", "ИНН", "Ходимлар", "1C", "Солиқ режими", "Период"]
                        + [x for _k, _n, x in TAXES] + ["Изоҳ"])]
     for i, r in enumerate(m["rows"], 1):
         c = r["c"]
@@ -2065,7 +2116,8 @@ def matrix_csv(per, kind=""):
         for k, _n, _x in TAXES:
             ce = r["cells"][k]
             vals.append(ce.get("detail") if ce["st"] == "note" else ("йук" if ce.get("never") else WORDS.get(ce["st"], "")))
-        lines.append(_csv_line([i, c["name"], c.get("activity"), c["inn"], r["staff"], c.get("c1")] + vals + [c.get("note")]))
+        lines.append(_csv_line([i, c["name"], c.get("activity"), c["inn"], r["staff"], c.get("c1"), c.get("regime"),
+                                c.get("perk")] + vals + [c.get("note")]))
     return "﻿" + "\r\n".join(lines) + "\r\n"
 
 
@@ -2076,6 +2128,14 @@ def matrix_api(f):
     if len(inn) not in (9, 14) or not re.match(r"^\d{4}-(0[1-9]|1[0-2])$", per):
         return {"ok": False, "error": "Noto'g'ri so'rov — sahifani yangilang"}
     kind, v = f.get("kind", ""), f.get("v", "")
+    if kind == "staff":
+        # Hodim tanlandi: shu davr boshidan (oyning 1-kunidan) korxona unga biriktiriladi, tarix saqlanadi.
+        uid = int(v) if v.isdigit() else None
+        if uid is not None and not emp(uid):
+            return {"ok": False, "error": "Bunday faol hodim yo'q — sahifani yangilang"}
+        set_owner(inn, uid, per + "-01")
+        q("UPDATE companies SET staff=? WHERE inn=?", (emp(uid)["name"] if uid else "", inn))
+        return {"ok": True, "reload": True}
     if kind == "co":
         field = f.get("field", "")
         if field not in CO_FIELDS:
@@ -2127,10 +2187,17 @@ def matrix_post(path, f, fl):
         q("UPDATE companies SET active=0 WHERE inn=?", (inn,))
         return "co_hidden"
     if act == "add":
-        q("INSERT INTO companies(inn,name,tg_id,activity,staff,active,sort) VALUES(?,?,NULL,?,?,1,"
+        uid = int(f["uid"]) if f.get("uid", "").isdigit() else None
+        e_ = emp(uid) if uid else None
+        q("INSERT INTO companies(inn,name,tg_id,activity,staff,regime,perk,active,sort) VALUES(?,?,NULL,?,?,?,?,1,"
           "(SELECT COALESCE(MAX(sort),0)+1 FROM companies)) ON CONFLICT(inn) DO UPDATE SET active=1, "
-          "name=COALESCE(NULLIF(excluded.name,''),companies.name), activity=excluded.activity, staff=excluded.staff",
-          (inn, clip("name", 120), clip("activity", 80), clip("staff", 80)))
+          "name=COALESCE(NULLIF(excluded.name,''),companies.name), activity=excluded.activity, staff=excluded.staff, "
+          "regime=excluded.regime, perk=excluded.perk",
+          (inn, clip("name", 120), clip("activity", 80), e_["name"] if e_ else "", clip("regime", 40), clip("perk", 40)))
+        if e_:
+            per = f.get("p", "")
+            day = per + "-01" if re.match(r"^\d{4}-(0[1-9]|1[0-2])$", per) else now().date().isoformat()
+            set_owner(inn, uid, day)
         for t in fl.get("tax", []):
             if t in TAX_NAME:
                 q("INSERT OR REPLACE INTO obligations(inn,tax,required,freq,source) VALUES(?,?,1,'m','manual')", (inn, t))
