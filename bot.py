@@ -22,6 +22,8 @@ import urllib.request
 from datetime import date, datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import screentime as st  # hodim kompyuterlari: screen time + boshqaruv (screentime.py)
+
 import sys
 for _s in (sys.stdout, sys.stderr):  # Windows konsolida emoji xatosiz chiqsin
     try:
@@ -41,7 +43,7 @@ DASH_PASSWORD = CFG.get("DASHBOARD_PASSWORD", "")
 DASH_USER = CFG.get("DASHBOARD_USER", "")          # bo'sh bo'lsa istalgan login qabul qilinadi
 LOGIN_FAILS = {}                                    # ip -> [vaqtlar], parol tanlashdan himoya
 MAX_FAILS, FAIL_WINDOW = 10, 900                    # 15 daqiqada 10 ta xato -> vaqtincha blok
-WORK_START = CFG.get("WORK_START", "09:00")
+WORK_START = CFG.get("WORK_START", "09:30")
 WORK_END = CFG.get("WORK_END", "18:30")
 WORK_DAYS = set(CFG.get("WORK_DAYS", [0, 1, 2, 3, 4]))          # 0=Dushanba ... 6=Yakshanba
 HOLIDAYS = set(CFG.get("HOLIDAYS", []))                          # ["2026-12-08", ...]
@@ -49,6 +51,11 @@ PERIOD = CFG.get("VIOLATION_PERIOD", "month")                    # "month" yoki 
 ABSENT_IS_VIOLATION = CFG.get("ABSENT_IS_VIOLATION", True)
 FORWARD_VIDEOS = CFG.get("FORWARD_VIDEOS_TO_OWNER", False)
 DB_PATH = CFG.get("DB_PATH", os.path.join(BASE, "data.db"))
+# Tunnel manzili o'zgarsa agent va skript yangisini shu yerdan topadi (bot profilida link ko'rinmasin).
+# Serverning doimiy IP manzilida faqat /u ni beradigan kichik HTTP; javob imzolangan — soxtasini qabul qilmaydi.
+DISC_PORT = int(CFG.get("DISCOVERY_PORT", 0))
+DISC_URL = CFG.get("DISCOVERY_URL", "")             # masalan "http://165.227.155.177:8099/u"
+DISC_SECRET = __import__("hashlib").sha256(("disc:" + CFG["BOT_TOKEN"]).encode()).hexdigest()[:32]
 
 TZ = timezone(timedelta(hours=5))  # Toshkent (yozgi vaqt yo'q)
 
@@ -134,11 +141,21 @@ CREATE TABLE IF NOT EXISTS obligations(
   inn TEXT, tax TEXT, required INTEGER, freq TEXT DEFAULT 'm', source TEXT DEFAULT 'manual', PRIMARY KEY(inn, tax));
 """)
 for _col, _typ in (("activity", "TEXT"), ("staff", "TEXT"), ("c1", "TEXT"), ("note", "TEXT"),
-                   ("regime", "TEXT"), ("perk", "TEXT"),
+                   ("regime", "TEXT"), ("perk", "TEXT"), ("rating", "TEXT"), ("rating_ts", "TEXT"),
                    ("sort", "INTEGER"), ("active", "INTEGER DEFAULT 1")):
     if _col not in {r[1] for r in db.execute("PRAGMA table_info(companies)")}:
         db.execute(f"ALTER TABLE companies ADD COLUMN {_col} {_typ}")
 db.commit()
+# Korxonalar ro'yxati faqat qo'lda to'ldiriladi (dashboard "+ Mijoz" yoki botda /firma).
+# active: 1 — bizning mijoz; 0 — karzinada (bildirishnoma kelmaydi, jadvalda yo'q; qaytarish yoki butunlay o'chirish mumkin).
+# Bir martalik: hisobot kelgani uchun o'zi qo'shilib qolgan (hech kim qo'shmagan/biriktirmagan) korxonalar karzinaga.
+if not db.execute("SELECT 1 FROM meta WHERE k='manual_list_v1'").fetchone():
+    db.execute("UPDATE companies SET active=0 WHERE tg_id IS NULL AND sort IS NULL AND COALESCE(staff,'')='' "
+               "AND inn NOT IN (SELECT inn FROM assignments) AND inn NOT IN (SELECT inn FROM obligations) "
+               "AND inn NOT IN (SELECT inn FROM filings WHERE source!='soliq')")
+    db.execute("INSERT INTO meta(k,v) VALUES('manual_list_v1', datetime('now'))")
+    db.commit()
+LISTED = "COALESCE(active,1)=1"   # SQL sharti: korxona bizning ro'yxatda
 
 
 def q(sql, args=(), one=False):
@@ -378,8 +395,9 @@ def stats(a, b):
         viol = q("SELECT * FROM violations WHERE tg_id=? AND day>=? ORDER BY day", (e["tg_id"], ms.isoformat()))
         fine_pct = sum(v["fine_pct"] for v in viol)
         level = max([v["level"] for v in viol], default=0)
-        comps = q("SELECT inn,name FROM companies WHERE tg_id=? ORDER BY name", (e["tg_id"],))
-        reps = q("SELECT COUNT(DISTINCT report_id) c FROM reports WHERE tg_id=? AND ts>=? AND ts<?",
+        comps = q(f"SELECT inn,name FROM companies WHERE tg_id=? AND {LISTED} ORDER BY name", (e["tg_id"],))
+        reps = q("SELECT COUNT(DISTINCT report_id) c FROM reports WHERE tg_id=? AND ts>=? AND ts<? "
+                 f"AND inn IN (SELECT inn FROM companies WHERE {LISTED})",
                  (e["tg_id"], a.isoformat(), (b + timedelta(days=1)).isoformat()), one=True)["c"]
         eff = round(100 * on_time / len(counted)) if counted else None
         today_row = by.get(today.isoformat())
@@ -467,10 +485,12 @@ def handle_report(e, body):
         return 200, {"ok": True, "duplicate": True}
 
     c = q("SELECT * FROM companies WHERE inn=?", (inn,), one=True)
-    if c and company and not c["name"]:
+    if not c or c["active"] == 0:
+        # Bizning ro'yxatda yo'q (yoki karzinadagi) korxona — hodim kabinetidagi boshqa firma.
+        # Hisobot saqlanadi (keyin ro'yxatga qo'shilsa jadvalga tushadi), lekin xabar yuborilmaydi.
+        return 200, {"ok": True, "ignored": True}
+    if company and not c["name"]:
         q("UPDATE companies SET name=? WHERE inn=?", (company, inn))
-    if inn and not c:   # yangi mijoz — jadvalda ko'rinsin (hodimga keyin biriktiriladi)
-        q("INSERT OR IGNORE INTO companies(inn,name,tg_id) VALUES(?,?,NULL)", (inn, company))
     try:
         record_filing(inn, rec, e["name"], now().isoformat())
     except Exception:
@@ -506,6 +526,8 @@ def handle_report(e, body):
     lines += ["", "━━━━━━━━━━━━━━━",
               f"🏢 <b>Kabinet:</b> {esc(company or '—')}",
               f"🔢 <b>ИНН:</b> <code>{esc(inn)}</code>"]
+    if c and c["rating"]:
+        lines.append(f"⭐ <b>Reyting:</b> {esc(c['rating'])}")
     if cert:
         lines.append(f"🔑 <b>Kabinet sertifikati:</b> {esc(cert)}")
     lines.append(f"👷 <b>Yuborgan hodim:</b> {esc(e['name'])}")
@@ -675,11 +697,12 @@ def period_matrix(per):
         obl.setdefault(o["inn"], {})[o["tax"]] = o
     # Excel davrlari (import qilingan oxirgi oygacha) — tarix: faqat o'sha oyda bor bo'lgan ma'lumot ko'rsatiladi.
     hist = is_hist(per)
-    comps = q("SELECT * FROM companies WHERE (COALESCE(active,1)=1 AND ?=0) OR inn IN "
-              "(SELECT inn FROM filings WHERE period=?) ORDER BY sort IS NULL, sort, name", (int(hist), per))
-    known = {c["inn"] for c in comps}
+    # Karzinadagi korxonalar hech qachon ko'rinmaydi; ro'yxatdagilar — joriy davrlarda hammasi, tarixda — ma'lumoti borlari.
+    comps = q(f"SELECT * FROM companies WHERE {LISTED} AND (?=0 OR inn IN (SELECT inn FROM filings WHERE period=?)) "
+              "ORDER BY sort IS NULL, sort, name", (int(hist), per))
+    allinn = {r["inn"] for r in q("SELECT inn FROM companies")}
     extra = [{"inn": i, "name": "", "activity": "", "staff": "", "c1": "", "note": "", "active": 0, "tg_id": None}
-             for i in fil if i not in known]
+             for i in fil if hist and i not in allinn]
     overdue = now().date() > period_due(per)
     by_key = {}
     for e_ in active_employees():
@@ -740,7 +763,7 @@ def debt_text(per=None):
         lines += groups[who]
     if not groups:
         lines.append("🎉 Hamma hisobotlar topshirilgan.")
-    lines.append(f"\n📊 Jadval: {current_url()}/hisobotlar?p={per}")
+    lines.append(f"\n📊 Jadval: {current_url()}/hisobotlar?p={period_shift(per, 1)}")
     return "\n".join(lines)
 
 
@@ -822,7 +845,26 @@ def assign_companies(uid, items, day=None):
         if old and old["tg_id"] not in (None, uid):
             moved.append(f"{inn} ({emp_name(old['tg_id'])} dan)")
         set_owner(inn, uid, day, name)
+        activate_company(inn)
     return moved
+
+
+def activate_company(inn):
+    """Korxonani ro'yxatga qo'shadi (karzinadan qaytaradi) va avval kelgan hisobotlarini jadvalga yozadi."""
+    q("UPDATE companies SET active=1, sort=COALESCE(sort,(SELECT COALESCE(MAX(sort),0)+1 FROM companies)) "
+      "WHERE inn=?", (inn,))
+    backfill_filings(inn)
+
+
+def purge_company(inn):
+    """Karzinadagi korxonani butunlay o'chiradi (jadval, majburiyatlar, biriktirish tarixi, hisobotlar)."""
+    with LOCK:
+        if not db.execute("SELECT 1 FROM companies WHERE inn=? AND active=0", (inn,)).fetchone():
+            return False
+        for t in ("filings", "obligations", "assignments", "reports", "companies"):
+            db.execute(f"DELETE FROM {t} WHERE inn=?", (inn,))
+        db.commit()
+    return True
 
 
 def company_label(inn):
@@ -996,6 +1038,8 @@ def handle_callback(cq):
     if cq.get("from", {}).get("id") != OWNER:
         return
     data = cq.get("data") or ""
+    if login_callback(cq, data) or st.handle_callback(data):
+        return
     p = data.split(":")
     if data.startswith("asg:") and data[4:].isdigit():
         ask_company_lines(int(data[4:]))
@@ -1058,6 +1102,10 @@ OWNER_HELP = f"""👑 <b>Owner buyruqlari</b>
 /kochir ESKI_ID YANGI_ID [sana] — hammasini ko'chirish
 /move YANGI_ID INN [INN ...] [sana] — tanlangan korxonalarni ko'chirish
 /tarix [INN yoki TG_ID] — kim qaysi korxonaga qachondan qachongacha qaragan
+
+<b>Dashboard xavfsizligi</b>
+/chiqar — dashboarddagi hamma sessiyalarni yopish
+/ipblok — bloklangan IP lar (blokdan chiqarish)
 (sana: 01.11.2026; yozilmasa — bugundan)
 
 <b>Hisobotlar</b>
@@ -1067,6 +1115,7 @@ OWNER_HELP = f"""👑 <b>Owner buyruqlari</b>
 /forgive TG_ID — oxirgi qoidabuzarlikni bekor qilish
 /qarz [10.2026] — qaysi korxonaning qaysi hisoboti hali topshirilmagan (standart: o'tgan oy)
 /dashboard — dashboard havolasi
+{st.HELP}
 
 Ish vaqti: {WORK_START}–{WORK_END}, hodim {WORK_START} gacha yumaloq video yuboradi."""
 
@@ -1082,6 +1131,8 @@ def handle_owner(text):
             return None
         return int(args[i])
 
+    if st.handle_command(cmd, args):
+        return
     if cmd in ("/start", "/help"):
         send(OWNER, OWNER_HELP)
     elif cmd == "/add" and not args:
@@ -1179,15 +1230,26 @@ def handle_owner(text):
             if inn.isdigit():
                 set_owner(inn, None, now().date().isoformat())
         send(OWNER, "✅ Bajarildi (tarix saqlandi).")
+    elif cmd == "/chiqar":
+        n = len(SESSIONS)
+        SESSIONS.clear()
+        send(OWNER, f"🚪 Dashboarddagi hamma sessiyalar yopildi ({n} ta).")
+    elif cmd == "/ipblok":
+        ips = sorted(blocked_ips())
+        if not ips:
+            send(OWNER, "Bloklangan IP yo'q.")
+        else:
+            send_kb(OWNER, "🚫 <b>Bloklangan IP manzillar</b>\nBosing — blokdan chiqariladi.",
+                    [[(f"↩ {ip}", f"lunb:{ip}")] for ip in ips[:30]])
     elif cmd == "/list":
         lines = ["👥 <b>Hodimlar</b>"]
         for e in active_employees():
-            comps = q("SELECT inn,name FROM companies WHERE tg_id=? ORDER BY name", (e["tg_id"],))
+            comps = q(f"SELECT inn,name FROM companies WHERE tg_id=? AND {LISTED} ORDER BY name", (e["tg_id"],))
             lines.append(f"\n👷 <b>{esc(e['name'])}</b> — ID <code>{e['tg_id']}</code>, "
                          f"maosh {money(e['salary']) if e['salary'] else '—'}, firmalar: {len(comps)}")
             for c in comps:
                 lines.append(f"   • {esc(c['name'] or '(nomi hali yo‘q)')} — {c['inn']}")
-        free = q("SELECT inn,name FROM companies WHERE tg_id IS NULL")
+        free = q(f"SELECT inn,name FROM companies WHERE tg_id IS NULL AND {LISTED}")
         if free:
             lines.append("\n❔ <b>Biriktirilmagan firmalar</b>")
             lines += [f"   • {esc(c['name'] or '')} — {c['inn']}" for c in free]
@@ -1266,6 +1328,8 @@ def handle_update(u):
         return
     if uid == OWNER and text and PENDING.pop("add", None):
         return handle_owner("/add " + text)
+    if uid == OWNER and text and "pcmsg" in PENDING:
+        return st.finish_msg(PENDING.pop("pcmsg"), text)
     if uid == OWNER and text and "assign" in PENDING:
         return finish_company_lines(text)
     if uid == OWNER and text and "date" in PENDING:
@@ -1286,6 +1350,14 @@ def handle_update(u):
         return send(uid, "❌ Oddiy video emas — <b>yumaloq video</b> (video xabar) yuboring.")
     if text.startswith("/key"):
         return send(uid, script_help(e["api_key"]))
+    if text.startswith("/agent"):
+        # Kompyuterga agent o'rnatish yo'riqnomasi (server manzili bor) — 10 daqiqadan keyin chatdan o'chiriladi.
+        r = tg("sendMessage", chat_id=uid, text=st.agent_text(temporary=True), parse_mode="HTML",
+               disable_web_page_preview=True)
+        ids = [i for i in (msg.get("message_id"), (r or {}).get("message_id")) if i]
+        threading.Timer(600, lambda: [tg("deleteMessage", chat_id=uid, message_id=i) for i in ids]).start()
+        return send(OWNER, f"🧩 {esc(e['name'])} /agent yozdi — o'rnatish yo'riqnomasi unga yuborildi "
+                           f"(10 daqiqadan keyin chatdan o'chadi).")
     if text.startswith("/me") or text.startswith("/start"):
         a, b = week_range()
         s = next((x for x in stats(a, b) if x["e"]["tg_id"] == uid), None)
@@ -1345,6 +1417,7 @@ def scheduler():
                 if d == last_wd and n >= at(d, WORK_END) + timedelta(minutes=5) and once(f"weekly:{d}"):
                     a, b = week_range(d)
                     send(OWNER, summary_text("Haftalik hisobot", a, b))
+            st.tick(n)
         except Exception:
             traceback.print_exc()
         time.sleep(30)
@@ -1399,15 +1472,214 @@ def session_end(token):
     SESSIONS.pop(token or "", None)
 
 
+# Telegram'dagi kirish ogohlantirishidan rahbar begona kirishni chiqarib yuborishi va IP ni bloklashi mumkin
+LOGINS = {}     # qisqa id -> {"token", "ip"} (oxirgi kirishlar)
+
+
+def blocked_ips():
+    r = q("SELECT v FROM meta WHERE k='blocked_ips'", one=True)
+    try:
+        return set(json.loads(r["v"])) if r else set()
+    except ValueError:
+        return set()
+
+
+def set_blocked_ips(ips):
+    q("INSERT OR REPLACE INTO meta(k,v) VALUES('blocked_ips',?)", (json.dumps(sorted(ips)),))
+
+
+def login_callback(cq, data):
+    """lkick:ID — shu kirishni chiqarish + IP blok; lall — hamma sessiyalarni yopish; lok:ID — bu men;
+    lunb:IP — IP ni blokdan chiqarish. Tegishli bo'lsa True."""
+    p = data.split(":", 1)
+    if p[0] not in ("lkick", "lall", "lok", "lunb"):
+        return False
+    mid = (cq.get("message") or {}).get("message_id")
+    if mid and p[0] != "lunb":
+        tg("editMessageReplyMarkup", chat_id=OWNER, message_id=mid, reply_markup={"inline_keyboard": []})
+    if p[0] == "lok":
+        send(OWNER, "👍 Yaxshi, bu kirish sizniki deb belgilandi.")
+    elif p[0] == "lall":
+        n = len(SESSIONS)
+        SESSIONS.clear()
+        send(OWNER, f"🚪 Dashboarddagi hamma sessiyalar yopildi ({n} ta). Endi qaytadan parol bilan kirish kerak.")
+    elif p[0] == "lkick" and len(p) == 2:
+        info = LOGINS.pop(p[1], None)
+        if not info:
+            return send(OWNER, "Bu kirish topilmadi (bot qayta ishga tushgan bo'lishi mumkin). "
+                               "Hamma sessiyalarni yopish: /chiqar") or True
+        session_end(info["token"])
+        ips = blocked_ips() | {info["ip"]}
+        set_blocked_ips(ips)
+        send_kb(OWNER, f"🚫 Chiqarib yuborildi va IP <code>{esc(info['ip'])}</code> bloklandi — bu manzildan dashboardga "
+                       f"kirib bo'lmaydi.\n\n⚠️ Parolni ham almashtiring: begona odam uni biladi.",
+                [[("↩ IP ni blokdan chiqarish", f"lunb:{info['ip']}")]])
+    elif p[0] == "lunb" and len(p) == 2:
+        set_blocked_ips(blocked_ips() - {p[1]})
+        send(OWNER, f"↩ IP <code>{esc(p[1])}</code> blokdan chiqarildi.")
+    return True
+
+
 LOGIN_MSG = {"bad": "Login yoki parol noto‘g‘ri", "expired": "1 soat harakatsiz qolgani uchun tizimdan chiqarildingiz",
-             "out": "Tizimdan chiqdingiz", "blocked": "Juda ko‘p xato urinish. 15 daqiqadan keyin urining"}
+             "out": "Tizimdan chiqdingiz", "blocked": "Juda ko‘p xato urinish. 15 daqiqadan keyin urining",
+             "denied": "Bu manzildan kirish rahbar tomonidan bloklangan"}
+
+
+# ---------------------------------------------------------------- brend (Gigant Buxgalter brendbuki)
+# Ranglar logotipdan: ko'mir #2C2B29, to'q sariq #F28322, gradient #ED6A23 → #F39614. Shrift: DM Sans (+ Delius mayda izohlar uchun).
+BRAND_HEAD = ('<link rel="preconnect" href="https://fonts.googleapis.com">'
+              '<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>'
+              '<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,400..700'
+              '&family=Delius&display=swap">'
+              '<link rel="icon" href="/brand/logo.png">')
+BRAND_CSS = """
+:root{--ink:#2C2B29;--mut:#857a70;--acc:#F28322;--acc-deep:#ED6A23;--acc-soft:rgba(242,131,34,.12);
+--grad:linear-gradient(135deg,#F39614 0%,#ED6A23 100%);
+--glass:rgba(255,255,255,.62);--edge:rgba(255,255,255,.78);--line:rgba(44,43,41,.08);--shadow:rgba(120,60,20,.10);
+--field:rgba(255,255,255,.8);--dlg:rgba(255,251,247,.96);--solid:#fffaf6;
+--bg1:#fbf4ee;--bg2:#f6e9df;--b1:rgba(243,150,20,.38);--b2:rgba(237,106,35,.30);--b3:rgba(150,110,200,.16)}
+@media (prefers-color-scheme:dark){:root{--ink:#f4eee8;--mut:#a89d93;--acc:#F59A3C;--acc-soft:rgba(242,131,34,.16);
+--glass:rgba(28,26,30,.62);--edge:rgba(255,255,255,.08);--line:rgba(255,255,255,.07);--shadow:rgba(0,0,0,.45);
+--field:rgba(0,0,0,.25);--dlg:rgba(24,22,26,.97);--solid:#17161a;
+--bg1:#0A0B12;--bg2:#141218;--b1:rgba(237,106,35,.28);--b2:rgba(243,150,20,.16);--b3:rgba(120,90,190,.14)}}
+body{font-family:"DM Sans","Segoe UI",system-ui,sans-serif!important;font-size:14px;letter-spacing:-.005em;
+background:radial-gradient(1100px 620px at 0% -10%,var(--b1),transparent 60%),
+radial-gradient(900px 560px at 100% 0%,var(--b2),transparent 58%),
+radial-gradient(900px 600px at 70% 110%,var(--b3),transparent 60%),
+linear-gradient(170deg,var(--bg1),var(--bg2))!important;background-attachment:fixed!important;
+font-variant-numeric:tabular-nums;-webkit-font-smoothing:antialiased}
+button,input,select,textarea{font-family:inherit}
+h1:before{display:none!important}
+h1{font-weight:600!important;letter-spacing:-.025em!important}
+h2{color:var(--mut)!important;font-weight:600!important;letter-spacing:.06em!important}
+.glass{background:var(--glass)!important;border-color:var(--edge)!important;
+box-shadow:0 1px 0 var(--edge) inset,0 18px 50px -24px var(--shadow)!important}
+.btn{background:var(--grad)!important;box-shadow:0 8px 20px -10px var(--acc-deep)!important;font-weight:600}
+.btn.ghost{background:var(--glass)!important;color:var(--ink)!important;border:1px solid var(--edge)!important;
+box-shadow:0 4px 14px -10px var(--shadow)!important;backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px)}
+.btn.ghost:hover{background:#fff!important}
+@media (prefers-color-scheme:dark){.btn.ghost:hover{background:rgba(255,255,255,.1)!important}}
+.btn.red,.btn.stop{background:#d4321c!important;box-shadow:0 8px 22px -10px #d4321c!important}
+.btn.ok{background:#16a34a!important;box-shadow:0 8px 22px -10px #16a34a!important}
+.kpi b{color:var(--ink)!important;font-weight:600!important}
+.kpi:first-child b{background:var(--grad);-webkit-background-clip:text;background-clip:text;color:transparent!important}
+.topbar{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;margin:0 0 26px}
+.brand{display:flex;align-items:center;text-decoration:none}
+.brand img{height:40px;width:auto;display:block}.brand .logo-d{display:none}
+@media (prefers-color-scheme:dark){.brand .logo-l{display:none}.brand .logo-d{display:block}}
+.navpill{display:flex;gap:4px;padding:5px;border-radius:999px}
+.navpill a{padding:8px 18px;border-radius:999px;text-decoration:none;color:var(--mut);font-weight:500;font-size:13.5px;transition:color .15s,background .15s}
+.navpill a:hover{color:var(--ink)}
+.navpill a.on{background:#fff;color:var(--ink);font-weight:600;box-shadow:0 4px 14px -6px rgba(44,43,41,.25)}
+@media (prefers-color-scheme:dark){.navpill a.on{background:rgba(255,255,255,.14)}}
+.navout{color:var(--mut);text-decoration:none;font-weight:500;font-size:13px;padding:8px 14px;border-radius:999px}
+.navout:hover{color:var(--ink);background:var(--glass)}
+@media (max-width:700px){.topbar{gap:10px}.brand img{height:32px}.navpill a{padding:7px 12px;font-size:12.5px}}
+/* --- ikkinchi shrift (qo'lyozma uslubi) — faqat mayda izoh va yorliqlar uchun --- */
+.sub,.mut,.kpi span,.lg,.csum,.dsum,.flash,.foot,p.sub{font-family:Delius,"DM Sans",cursive!important;letter-spacing:0!important}
+/* --- tipografiya: o'qiladigan o'lchamlar, mayda KATTA HARFLI yozuvlarsiz --- */
+body{font-size:15px!important;line-height:1.5}
+.sub,.mut{font-size:13px}
+h1{font-size:30px!important}
+h2{font-size:18px!important;text-transform:none!important;letter-spacing:-.01em!important;color:var(--ink)!important;margin-top:40px!important}
+th{font-size:12.5px!important;text-transform:none!important;letter-spacing:0!important;font-weight:500!important}
+.kpi span{font-size:14px!important}.kpi b{font-size:38px!important;letter-spacing:-.035em!important}
+.pill{font-size:12.5px!important;padding:4px 11px!important;display:inline-flex!important;align-items:center;gap:6px}
+.btn{font-size:14px!important;padding:10px 18px!important}
+.btn.sm{font-size:13px!important;padding:8px 14px!important}
+.btn.big{font-size:17px!important;padding:17px 20px!important;border-radius:18px!important}
+.state{display:flex;align-items:center;gap:10px;font-size:16px!important}
+/* --- ikonkalar (SF Symbols uslubi) --- */
+.ic{width:1.15em;height:1.15em;flex:none;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round;
+vertical-align:-.2em;margin-right:.4em}
+.btn,.btn.sm,a.btn{display:inline-flex!important;align-items:center;justify-content:center;gap:0}
+.flash{display:flex;align-items:center;gap:4px}.flash .ic{color:var(--acc);width:20px;height:20px}
+.sd{width:8px;height:8px;border-radius:50%;background:currentColor;display:inline-block;flex:none}
+/* --- "liquid glass" tugmalar: shisha yaltirashi, bosilganda siqiladi, holat o'zgarsa silliq o'tadi --- */
+.btn{position:relative;overflow:hidden;isolation:isolate;
+transition:transform .35s cubic-bezier(.2,.9,.3,1.25),box-shadow .3s,background-color .35s,filter .2s!important}
+.btn:before{content:"";position:absolute;inset:0;border-radius:inherit;pointer-events:none;z-index:-1;
+background:linear-gradient(180deg,rgba(255,255,255,.38),rgba(255,255,255,0) 55%)}
+.btn.ghost:before{background:linear-gradient(180deg,rgba(255,255,255,.7),rgba(255,255,255,0) 60%)}
+@media (prefers-color-scheme:dark){.btn.ghost:before{background:linear-gradient(180deg,rgba(255,255,255,.10),transparent 60%)}}
+.btn:hover{transform:translateY(-1px) scale(1.015)!important;filter:saturate(1.08)}
+.btn:active{transform:scale(.95)!important;transition-duration:.12s!important}
+.btn.ghost{box-shadow:inset 0 1px 0 rgba(255,255,255,.9),0 6px 18px -12px var(--shadow)!important}
+.morph{animation:morph .55s cubic-bezier(.2,.9,.3,1.2)}
+@keyframes morph{0%{transform:scale(1);filter:blur(0)}35%{transform:scale(.94,.9);filter:blur(3px)}
+70%{transform:scale(1.02,1.03);filter:blur(0)}100%{transform:scale(1)}}
+dialog[open]{animation:pop .42s cubic-bezier(.2,.9,.3,1.15)}
+dialog[open]::backdrop{animation:fade .3s ease}
+@keyframes pop{from{opacity:0;transform:translateY(14px) scale(.94)}to{opacity:1;transform:none}}
+@keyframes fade{from{opacity:0}to{opacity:1}}
+/* bo'limlar orasida o'tganda menyudagi oq "tabletka" siljib o'tadi (Chrome) */
+@view-transition{navigation:auto}
+.navpill a.on{view-transition-name:navon}
+.navpill a{transition:color .25s,background-color .35s}
+@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+"""
+
+
+# iPhone (SF Symbols) uslubidagi chiziqli ikonkalar — emoji o'rniga (har qurilmada bir xil ko'rinadi)
+_IC = {
+    "camera": '<path d="M3 8.5A2.5 2.5 0 0 1 5.5 6H7l1.6-2.2h6.8L17 6h1.5A2.5 2.5 0 0 1 21 8.5v9a2.5 2.5 0 0 1-2.5 2.5h-13A2.5 2.5 0 0 1 3 17.5z"/><circle cx="12" cy="12.8" r="3.6"/>',
+    "message": '<path d="M20.5 11.6c0 4.2-3.8 7.4-8.5 7.4-1.1 0-2.2-.2-3.2-.5L4 20l1.3-3.7c-1.1-1.3-1.8-2.9-1.8-4.7C3.5 7.4 7.3 4.2 12 4.2s8.5 3.2 8.5 7.4z"/>',
+    "lock": '<rect x="5" y="10.5" width="14" height="10" rx="2.6"/><path d="M8 10.5V7.8a4 4 0 0 1 8 0v2.7"/>',
+    "unlock": '<rect x="5" y="10.5" width="14" height="10" rx="2.6"/><path d="M8 10.5V7.8a4 4 0 0 1 7.6-1.8"/>',
+    "key": '<circle cx="8" cy="15.5" r="4"/><path d="M10.9 12.6 20 3.5M16.6 6.9l2.5 2.5M14.4 9.1l1.8 1.8"/>',
+    "restart": '<path d="M19.8 12.5a7.8 7.8 0 1 1-2.3-6"/><path d="M19.8 4v4.6h-4.6"/>',
+    "power": '<path d="M12 3.5v8"/><path d="M6.5 7a8 8 0 1 0 11 0"/>',
+    "xcircle": '<circle cx="12" cy="12" r="8.8"/><path d="m9.2 9.2 5.6 5.6m0-5.6-5.6 5.6"/>',
+    "nosign": '<circle cx="12" cy="12" r="8.8"/><path d="m5.8 5.8 12.4 12.4"/>',
+    "trash": '<path d="M4.5 6.8h15M9.5 6.8V4.6h5v2.2M6.4 6.8l.9 12.4a1.6 1.6 0 0 0 1.6 1.5h6.2a1.6 1.6 0 0 0 1.6-1.5l.9-12.4M10 10.5v6.5M14 10.5v6.5"/>',
+    "download": '<path d="M12 3.8v11M7.6 10.6 12 15l4.4-4.4M5 19.6h14"/>',
+    "plus": '<path d="M12 5v14M5 12h14"/>',
+    "clock": '<circle cx="12" cy="12" r="8.8"/><path d="M12 7.2V12l3.2 2"/>',
+    "desktop": '<rect x="3" y="4" width="18" height="12.5" rx="2.2"/><path d="M9 20.2h6M12 16.5v3.7"/>',
+    "check": '<circle cx="12" cy="12" r="8.8"/><path d="m8.3 12.4 2.6 2.6 4.9-5.4"/>',
+    "warn": '<path d="M10.3 4.6 3.4 16.7A2 2 0 0 0 5.1 19.7h13.8a2 2 0 0 0 1.7-3L13.7 4.6a2 2 0 0 0-3.4 0z"/><path d="M12 9.5v4.2M12 16.6v.1"/>',
+    "undo": '<path d="M9 14.5 4 9.5l5-5"/><path d="M4 9.5h10.5a5.5 5.5 0 0 1 0 11H11"/>',
+    "late": '<circle cx="12" cy="12" r="8.8"/><path d="M12 7.2V12l3.2 2"/>',
+    "question": '<circle cx="12" cy="12" r="8.8"/><path d="M9.6 9.4a2.5 2.5 0 0 1 4.8.9c0 1.7-2.4 2.2-2.4 3.7M12 16.8v.1"/>',
+    "chart": '<path d="M4 20h16M7 16.5V11M12 16.5V6.5M17 16.5v-4"/>',
+    "building": '<path d="M4.5 20.5V5.2A1.2 1.2 0 0 1 5.7 4h7.6a1.2 1.2 0 0 1 1.2 1.2v15.3M14.5 9.5h3.8a1.2 1.2 0 0 1 1.2 1.2v9.8M3 20.5h18M8 8h3M8 11.5h3M8 15h3"/>',
+}
+EMOJI_IC = {"✅": "check", "⚠️": "warn", "⚠": "warn", "🗑": "trash", "↩": "undo", "📸": "camera", "⛔": "nosign",
+            "🔓": "unlock", "🔒": "lock", "🔑": "key", "💬": "message", "🔄": "restart", "⏻": "power", "✋": "xcircle",
+            "⬇": "download", "⏱": "clock", "🖥": "desktop", "⏰": "late", "❌": "xcircle", "❓": "question"}
+
+
+def ic(name, cls=""):
+    return (f'<svg class="ic{" " + cls if cls else ""}" viewBox="0 0 24 24" aria-hidden="true">{_IC.get(name, "")}</svg>')
+
+
+def iconize(text):
+    """'✅ Matn' -> <svg> + 'Matn' (veb uchun; Telegram xabarlarida emoji qoladi). HTML qaytaradi."""
+    s = str(text or "")
+    for e, n in EMOJI_IC.items():
+        if s.startswith(e):
+            return ic(n) + esc(s[len(e):].lstrip(" ️"))
+    return esc(s)
+
+
+IC_JS = json.dumps({k: ic(k) for k in _IC}).replace("<", "\\u003c")
+
+
+def brand_nav(active):
+    """Hamma sahifalar tepasidagi panel: logo + bo'limlar + chiqish."""
+    items = [("dashboard", "/dashboard", "Davomat"), ("hisobotlar", "/hisobotlar", "Hisobotlar"),
+             ("screentime", "/screentime", "Screen time")]
+    links = "".join(f'<a href="{u}"{" class=on" if k == active else ""}>{t}</a>' for k, u, t in items)
+    return (f'<nav class="topbar"><a class="brand" href="/dashboard" aria-label="Gigant Buxgalter">'
+            f'<img class="logo-l" src="/brand/logo.png" alt="Gigant Buxgalter"><img class="logo-d" src="/brand/logo-w.png" alt="">'
+            f'</a><div class="navpill glass">{links}</div><a class="navout" href="/logout">Chiqish</a></nav>')
 
 
 def render_login(err=""):
     msg = LOGIN_MSG.get(err, "")
     cls = "ok" if err == "out" else "err"
     return f"""<!DOCTYPE html><html lang="uz"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>Kirish · Hodimlar</title><style>
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Kirish · Gigant Buxgalter</title>{BRAND_HEAD}<style>
 :root{{--ink:#2b1a0f;--mut:#97755e;--acc:#f97316;--acc-soft:rgba(249,115,22,.14);--glass:rgba(255,255,255,.55);
 --edge:rgba(255,255,255,.85);--line:rgba(194,65,12,.14);--field:rgba(255,255,255,.75);--shadow:rgba(194,65,12,.16);
 --bg1:#fff8f1;--bg2:#ffe9d6;--b1:rgba(251,146,60,.55);--b2:rgba(253,186,116,.6);--r:#b91c1c;--r-bg:rgba(239,68,68,.12);--g:#15803d;--g-bg:rgba(34,197,94,.14)}}
@@ -1432,8 +1704,13 @@ background:var(--acc);color:#fff;box-shadow:0 8px 22px -8px var(--acc)}}
 .msg{{padding:10px 14px;border-radius:12px;font-weight:600;font-size:13px;margin-bottom:16px}}
 .msg.err{{background:var(--r-bg);color:var(--r)}}.msg.ok{{background:var(--g-bg);color:var(--g)}}
 .foot{{text-align:center;font-size:12px;color:var(--mut);margin-top:18px}}
+{BRAND_CSS}
+button{{background:var(--grad);box-shadow:0 10px 24px -12px var(--acc-deep)}}
+.card{{padding:36px 32px}}.brand{{justify-content:center;margin-bottom:26px}}.brand img{{height:52px}}
+h1{{justify-content:center;font-size:19px}}p{{text-align:center}}
 </style></head><body><form class="card" method="post" action="/login" autocomplete="on">
-<h1>Hodimlar dashboardi</h1><p>Davom etish uchun tizimga kiring</p>
+<div class="brand"><img class="logo-l" src="/brand/logo.png" alt="Gigant Buxgalter"><img class="logo-d" src="/brand/logo-w.png" alt=""></div>
+<h1>Boshqaruv paneli</h1><p>Davom etish uchun tizimga kiring</p>
 {f'<div class="msg {cls}">{esc(msg)}</div>' if msg else ''}
 <label>Login<input name="username" autocomplete="username" required autofocus></label>
 <label>Parol<input name="password" type="password" autocomplete="current-password" required></label>
@@ -1468,12 +1745,13 @@ def render_dashboard(flash=""):
     for s in week:
         m = month.get(s["e"]["tg_id"], s)
         t = s["today"]
-        today = ("✅ " + t["ts"][11:16] if t and t["status"] == "on_time" else
-                 "⏰ " + t["ts"][11:16] if t and t["status"] == "late" else
-                 "❌ kelmadi" if t else ("—" if not is_workday(d) else "❓ hali yo'q"))
+        today = (f'<span class="pill g">{ic("check")}{t["ts"][11:16]}</span>' if t and t["status"] == "on_time" else
+                 f'<span class="pill y">{ic("late")}{t["ts"][11:16]}</span>' if t and t["status"] == "late" else
+                 f'<span class="pill r">{ic("xcircle")}kelmadi</span>' if t else
+                 ("—" if not is_workday(d) else f'<span class="pill">{ic("clock")}hali yo‘q</span>'))
         lvl = lvl_txt.get(m["level"], "")
         rows.append(f"""<tr>
-<td><b>{esc(s['e']['name'])}</b><div class="sub">ID {s['e']['tg_id']}</div></td>
+<td><b>{esc(s['e']['name'])}</b><div class="sub">ID {s['e']['tg_id']} · <a href="/screentime?u={s['e']['tg_id']}" style="color:var(--acc);font-weight:600;text-decoration:none">{ic("desktop")}Kompyuter</a></div></td>
 <td>{today}</td>
 <td>{pill(s['eff'])}</td>
 <td>{s['on_time']} / {s['late']} / {s['absent']}</td>
@@ -1484,7 +1762,7 @@ def render_dashboard(flash=""):
 <td>{m['reports']}</td></tr>""")
 
     reps = q("SELECT r.*, e.name ename FROM reports r LEFT JOIN employees e ON e.tg_id=r.tg_id "
-             "ORDER BY r.ts DESC LIMIT 40")
+             f"WHERE r.inn IN (SELECT inn FROM companies WHERE {LISTED}) ORDER BY r.ts DESC LIMIT 40")
     rep_rows = []
     for r in reps:
         data = json.loads(r["data"] or "{}")
@@ -1520,7 +1798,7 @@ def render_dashboard(flash=""):
 <div class="macts"><button class="lnk" data-tr data-id="{e['tg_id']}" data-name="{esc(e['name'])}"
  data-comps="{esc(json.dumps([[c['inn'], c['name'] or ''] for c in s['comps']], ensure_ascii=False))}">⇄ Korxonalarni ko‘chirish</button>
 <button class="lnk danger" data-fire data-id="{e['tg_id']}" data-name="{esc(e['name'])}">Ishdan bo‘shatish</button></div></div>""")
-    flash_html = f'<div class="flash glass">{esc(FLASH[flash])}</div>' if flash in FLASH else ""
+    flash_html = f'<div class="flash glass">{iconize(FLASH[flash])}</div>' if flash in FLASH else ""
 
     total = len(week)
     on_today = sum(1 for s in week if s["today"] and s["today"]["status"] == "on_time")
@@ -1530,7 +1808,7 @@ def render_dashboard(flash=""):
 
     return f"""<!DOCTYPE html><html lang="uz"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Hodimlar samaradorligi</title><style>
+<title>Davomat · Gigant Buxgalter</title>{BRAND_HEAD}<style>
 :root{{--ink:#2b1a0f;--mut:#97755e;--acc:#f97316;--acc-soft:rgba(249,115,22,.12);
 --glass:rgba(255,255,255,.52);--edge:rgba(255,255,255,.85);--line:rgba(194,65,12,.10);--shadow:rgba(194,65,12,.10);
 --bg1:#fff8f1;--bg2:#ffe9d6;--b1:rgba(251,146,60,.55);--b2:rgba(253,186,116,.60);--b3:rgba(249,115,22,.30);
@@ -1604,12 +1882,12 @@ padding:10px 13px;border-radius:12px;border:1px solid var(--line);background:var
 :root{{--dlg:rgba(255,250,245,.88);--field:rgba(255,255,255,.7)}}
 @media (prefers-color-scheme:dark){{:root{{--dlg:rgba(38,22,12,.92);--field:rgba(0,0,0,.25)}}}}
 @media (max-width:600px){{.wrap{{padding:24px 16px 40px}}h1{{font-size:21px}}.kpi b{{font-size:28px}}}}
+{BRAND_CSS}
 </style></head><body><div class="wrap">
+{brand_nav("dashboard")}
 <header><h1>Hodimlar samaradorligi</h1>
 <div class="hright"><div class="mut meta glass">Hafta {a:%d.%m} – {b:%d.%m.%Y} · {WORK_START}–{WORK_END} · {now():%H:%M}</div>
-<a class="btn" href="/hisobotlar">📋 Hisobotlar jadvali</a>
-<button class="btn" id="addEmp">+ Hodim qo'shish</button>
-<a class="btn ghost" href="/logout">Chiqish</a></div></header>
+<button class="btn" id="addEmp">{ic("plus")}Hodim qo'shish</button></div></header>
 {flash_html}
 <div class="kpis">
 <div class="kpi glass"><span class="mut">Hodimlar</span><b>{total}</b></div>
@@ -1765,6 +2043,10 @@ td.x.pending>div{box-shadow:inset 0 0 0 1.5px var(--y);border-radius:6px;margin:
 td.x.na,td.x.never{color:var(--n);font-weight:500}td.x.never{opacity:.55}
 td.x.note{background:var(--n-bg);color:var(--ink);font-weight:500;white-space:normal}
 tr.gone td{opacity:.6}
+td.rt{font-weight:700;font-size:13px;text-align:center;min-width:76px;letter-spacing:.02em}
+td.rt.gA{color:#15803d;background:rgba(34,197,94,.14)}td.rt.gB{color:#4d7c0f;background:rgba(132,204,22,.16)}
+td.rt.gC{color:#c2410c;background:rgba(251,146,60,.18)}td.rt.gD,td.rt.gE{color:#b91c1c;background:rgba(239,68,68,.14)}
+td.per{font-weight:600;color:var(--ink);white-space:nowrap}
 td.del{padding:0 4px}td.del button{border:0;background:none;color:var(--mut);cursor:pointer;font-size:16px;width:28px;height:28px;border-radius:50%}
 td.del button:hover{background:var(--r-bg);color:var(--r)}
 #menu,#pick{position:fixed;z-index:50;width:290px;max-width:calc(100vw - 16px);padding:12px;border-radius:16px;background:var(--dlg);
@@ -1808,6 +2090,10 @@ dialog textarea{min-height:70px;resize:vertical}
 .taxpick{display:grid;grid-template-columns:1fr 1fr;gap:4px 12px;margin:6px 0 12px}
 .taxpick label{display:flex;gap:8px;align-items:center;margin:0;font-weight:500;color:var(--ink);font-size:13px}
 .close{display:flex;justify-content:flex-end;margin-top:14px}
+dialog.wide{width:min(640px,calc(100vw - 32px))}
+.trash{max-height:55vh;overflow:auto;margin-bottom:14px}.trash td{white-space:normal}
+.trash td.ta{text-align:right;white-space:nowrap}.trash td.ta form{display:inline-block;margin-left:6px}
+.btn.sm{padding:6px 12px;font-size:12px}.btn.danger{background:var(--r-bg);color:var(--r);box-shadow:none}
 @media (max-width:640px){.wrap{padding:20px 16px 40px}h1{font-size:21px}.kpi b{font-size:24px}
 td.co,th.co{min-width:150px}td.x{min-width:92px}}
 """
@@ -1890,20 +2176,24 @@ addEventListener('keydown',e=>{if(e.key==='Escape')closePick()});
 $$('.card').forEach(c=>c.addEventListener('scroll',closePick,{passive:true}));
 $('#addCo').onclick=()=>$('#dAdd').showModal();
 $$('[data-close]').forEach(b=>b.onclick=()=>b.closest('dialog').close());
-$$('form.hide').forEach(f=>f.onsubmit=()=>confirm('Korxona jadvaldan olib tashlansinmi? (tarixi saqlanadi)'));
+$$('form.hide').forEach(f=>f.onsubmit=()=>confirm('Korxona karzinaga o‘tkazilsinmi?\\nU haqida botga xabar kelmaydi. Karzinadan qaytarish mumkin.'));
+$$('form.purge').forEach(f=>f.onsubmit=()=>confirm('Korxona BUTUNLAY o‘chirilsinmi?\\nJadvaldagi belgilari, hisobotlari va tarixi o‘chadi. Qaytarib bo‘lmaydi.'));
+$('#trashBtn')&&($('#trashBtn').onclick=()=>$('#dTrash').showModal());
 let lastAct=/[?&]auto=1/.test(location.search)?0:Date.now();
 ['mousemove','mousedown','keydown','scroll','touchstart'].forEach(ev=>addEventListener(ev,()=>{lastAct=Date.now()},{passive:true}));
 setInterval(()=>{if(document.querySelector('dialog[open],[contenteditable=true]')||!menu.hidden||!pick.hidden||Date.now()-lastAct<110000)return;
- location.replace('/hisobotlar?p='+PERIOD+'&auto=1&active=0')},120000);
+ location.replace('/hisobotlar?p='+NAV+'&auto=1&active=0')},120000);
 """
 
-MX_FLASH = {"co_hidden": "✅ Korxona jadvaldan olib tashlandi", "co_add": "✅ Yangi mijoz qo'shildi",
+MX_FLASH = {"co_hidden": "🗑 Korxona karzinaga o'tkazildi — endi u haqida xabar kelmaydi",
+            "co_restored": "↩ Korxona karzinadan qaytarildi", "co_purged": "✅ Korxona butunlay o'chirildi",
+            "co_add": "✅ Yangi mijoz qo'shildi",
             "bad_inn": "⚠️ INN 9 yoki 14 raqam bo'lishi kerak", "stale": "⚠️ Sahifa eskirgan edi — yangilandi. Qayta urining."}
 WORDS = {"ok": "топширилган", "late": "кечикиб топширилган", "wait": "текширувда", "error": "хато", "na": "йук",
          "missing": "топширилмаган", "pending": "кутилмоқда"}
 LOG_FIELDS = ["№ Отчета", "№ Пакет", "Наименование", "Год", "Период", "Дата отправки", "Состояние", "Причина ошибки",
               "Дата проверки", "Инспектор", "Регион", "Сертификат", "Дата создания", "IP адрес"]
-CO_FIELDS = {"name": 120, "activity": 80, "staff": 80, "c1": 40, "note": 500, "regime": 40, "perk": 40}
+CO_FIELDS = {"name": 120, "activity": 80, "staff": 80, "c1": 40, "note": 500, "regime": 40, "perk": 40, "rating": 20}
 # Ro'yxatdan tanlanadigan ustunlar (Excel'dagi "Солик режими" va "Период"); "boshqa" matn ham yozish mumkin.
 REGIMES = ["Айланма", "НДС", "ЯТТ", "Фикс"]
 PERKS = ["Ойлик", "Чораклик", "Йиллик"]
@@ -1975,7 +2265,8 @@ def all_periods():
 def period_reports(per):
     """Shu davrga tegishli, bot qabul qilgan hamma hisobotlar (har biri oxirgi holati bilan)."""
     latest = {}
-    for r in q("SELECT r.*, e.name ename FROM reports r LEFT JOIN employees e ON e.tg_id=r.tg_id ORDER BY r.ts"):
+    for r in q("SELECT r.*, e.name ename FROM reports r LEFT JOIN employees e ON e.tg_id=r.tg_id "
+               f"WHERE r.inn IN (SELECT inn FROM companies WHERE {LISTED}) ORDER BY r.ts"):
         try:
             d = json.loads(r["data"] or "{}")
         except ValueError:
@@ -1985,11 +2276,24 @@ def period_reports(per):
     return sorted(latest.values(), key=lambda x: x[0]["ts"], reverse=True)
 
 
-def render_matrix(per, flash=""):
+def rating_grade(r):
+    """'С - 34' / 'A-80' -> ('C', 'C · 34'). Kirill harflar lotinga."""
+    s = str(r or "").strip().upper().translate(str.maketrans("АВСЕ", "ABCE"))
+    m = re.match(r"^([A-E])\s*[-–:·]?\s*(\d{1,3})?", s)
+    if not m:
+        return "", esc(r or "")
+    return m.group(1), m.group(1) + (f" · {m.group(2)}" if m.group(2) else "")
+
+
+def render_matrix(nav, flash=""):
+    """nav — tepada tanlangan oy (topshirish oyi). Jadval esa bir oy oldingi davr hisobotlari:
+    masalan, tepada Oktyabr bo'lsa — Sentyabr hisobotlari (oktyabrda sentyabr uchun topshiriladi)."""
+    per = period_shift(nav, -1)
     m = period_matrix(per)
     tot, by = matrix_counts(m)
     pct = round(100 * tot["done"] / tot["need"]) if tot["need"] else None
-    opts = "".join(f'<option value="{p}"{" selected" if p == per else ""}>{period_label(p)}</option>' for p in all_periods())
+    opts = "".join(f'<option value="{p}"{" selected" if p == nav else ""}>{period_label(p)}</option>'
+                   for p in sorted({period_shift(x, 1) for x in all_periods()}, reverse=True))
     staff_cards = "".join(
         f'<div class="st glass" data-s="{esc(s)}"><div class="top"><span>{esc(s)}</span>'
         f'<span class="mut">{v["done"]}/{v["need"]}</span></div>'
@@ -2013,20 +2317,35 @@ def render_matrix(per, flash=""):
         staff_td = (f'<td class="pk" data-f="staff" data-v="{r["resp"] or ""}" title="Bosing — hodimni tanlang">'
                     f'{esc(r["staff"])}</td>')
         rp_td = (f'<td class="pk" data-f="regime" data-v="{esc(c.get("regime") or "")}">{esc(c.get("regime") or "")}</td>'
-                    f'<td class="pk" data-f="perk" data-v="{esc(c.get("perk") or "")}">{esc(c.get("perk") or "")}</td>')
+                 f'<td class="ro per">{period_label(per)}</td>')
+        g, gtxt = rating_grade(c.get("rating"))
+        rt_td = (f'<td class="ed rt g{g}" data-f="rating" title="soliq.uz reytingi — hodim kabinetga kirganda o‘zi yangilanadi, '
+                 f'yoki bosib yozing (masalan: C - 34)">{esc(c.get("rating") or "")}</td>')
         key = f'{c["name"] or ""} {c["inn"]} {c.get("activity") or ""} {r["staff"]} {c.get("note") or ""}'.lower()
         gone = c.get("active", 1) not in (1, None)
         body.append(
             f'<tr{" class=gone" if gone else ""} data-k="{esc(key)}" data-s="{esc(r["staff"] or "—")}" '
             f'data-m="{1 if miss else 0}" data-inn="{esc(c["inn"])}" data-name="{esc(c["name"] or c["inn"])}">'
             f'<td class="n">{i}</td><td class="co ed" data-f="name">{esc(c["name"] or "")}</td>'
-            f'<td class="ed" data-f="activity">{esc(c.get("activity") or "")}</td><td class="ro">{esc(c["inn"])}</td>'
+            f'<td class="ed" data-f="activity">{esc(c.get("activity") or "")}</td><td class="ro">{esc(c["inn"])}</td>{rt_td}'
             f'{staff_td}<td class="ed" data-f="c1">{esc(c.get("c1") or "")}</td>{rp_td}{"".join(tds)}'
             f'<td class="ed" data-f="note" style="min-width:160px">{esc(c.get("note") or "")}</td>'
             f'<td class="del"><form class="hide" method="post" action="/dashboard/company">'
             f'<input type="hidden" name="inn" value="{esc(c["inn"])}"><input type="hidden" name="act" value="hide">'
-            f'<input type="hidden" name="p" value="{per}"><input type="hidden" name="csrf" value="{CSRF}">'
-            f'<button title="Jadvaldan olib tashlash" aria-label="Olib tashlash">×</button></form></td></tr>')
+            f'<input type="hidden" name="p" value="{nav}"><input type="hidden" name="csrf" value="{CSRF}">'
+            f'<button title="Karzinaga o‘tkazish" aria-label="Karzinaga">×</button></form></td></tr>')
+    # Karzina: olib tashlangan korxonalar — qaytarish yoki butunlay o'chirish
+    trash = q("SELECT c.*, (SELECT COUNT(*) FROM reports r WHERE r.inn=c.inn) nrep FROM companies c "
+              "WHERE active=0 ORDER BY name")
+    trash_rows = "".join(
+        f'<tr><td><b>{esc(c["name"] or "(nomsiz)")}</b><div class="sub">{esc(c["inn"])} · hisobotlar: {c["nrep"]}</div></td>'
+        f'<td class="ta"><form method="post" action="/dashboard/company"><input type="hidden" name="inn" value="{esc(c["inn"])}">'
+        f'<input type="hidden" name="act" value="restore"><input type="hidden" name="p" value="{nav}">'
+        f'<input type="hidden" name="csrf" value="{CSRF}"><button class="btn ghost sm">{ic("undo")}Qaytarish</button></form>'
+        f'<form class="purge" method="post" action="/dashboard/company"><input type="hidden" name="inn" value="{esc(c["inn"])}">'
+        f'<input type="hidden" name="act" value="purge"><input type="hidden" name="p" value="{nav}">'
+        f'<input type="hidden" name="csrf" value="{CSRF}"><button class="btn sm danger">{ic("trash")}Butunlay o‘chirish</button></form></td></tr>'
+        for c in trash)
     # Bot olgan barcha ma'lumotlar (shu davr)
     reps = period_reports(per)
     log_rows = []
@@ -2043,11 +2362,11 @@ def render_matrix(per, flash=""):
                         f'<td class="w"><b>{esc(r["company"] or "")}</b></td><td>{esc(r["inn"])}</td>'
                         f'<td>{esc(r["ename"] or "")}</td><td>{esc(col)}</td>{vals}</tr>')
     log_head = "".join(f"<th class=l>{esc(f)}</th>" for f in LOG_FIELDS)
-    fl = f'<div class="flash glass">{esc(MX_FLASH[flash])}</div>' if flash in MX_FLASH else ""
+    fl = f'<div class="flash glass">{iconize(MX_FLASH[flash])}</div>' if flash in MX_FLASH else ""
     staff_opts = "".join(f'<option value="{esc(s)}">{esc(s)}</option>' for s in sorted(by))
     tax_checks = "".join(f'<label><input type="checkbox" name="tax" value="{k}"'
                          f'{" checked" if k == "jshds" else ""}> {esc(x)}</label>' for k, _n, x in TAXES)
-    hidden = f'<input type="hidden" name="p" value="{per}"><input type="hidden" name="csrf" value="{CSRF}">'
+    hidden = f'<input type="hidden" name="p" value="{nav}"><input type="hidden" name="csrf" value="{CSRF}">'
     due = period_due(per)
     emps = [(str(e_["tg_id"]), e_["name"]) for e_ in active_employees()]
     picks = {"staff": emps + [("", "— biriktirilmagan")],
@@ -2058,16 +2377,17 @@ def render_matrix(per, flash=""):
     reg_opts = "".join(f'<option>{esc(x)}</option>' for x in REGIMES)
     perk_opts = "".join(f'<option>{esc(x)}</option>' for x in PERKS)
     return f"""<!DOCTYPE html><html lang="uz"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>Hisobotlar jadvali</title>
-<style>{MATRIX_CSS}</style></head><body><div class="wrap">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Hisobotlar · Gigant Buxgalter</title>{BRAND_HEAD}
+<style>{MATRIX_CSS}{BRAND_CSS}thead th,td.co,th.co{{background:var(--solid)!important}}</style></head><body><div class="wrap">
+{brand_nav("hisobotlar")}
 <header><h1>Hisobotlar jadvali</h1>
 <div class="hright">
-<div class="pnav glass"><a href="/hisobotlar?p={period_shift(per, -1)}" title="Oldingi oy">‹</a>
-<select id="per" aria-label="Davr">{opts}</select>
-<a href="/hisobotlar?p={period_shift(per, 1)}" title="Keyingi oy">›</a></div>
-<a class="btn ghost" href="/hisobotlar.csv?p={per}">⬇ Excel</a>
-<button class="btn" id="addCo">+ Mijoz</button>
-<a class="btn ghost" href="/dashboard">Dashboard</a></div></header>
+<div class="pnav glass"><a href="/hisobotlar?p={period_shift(nav, -1)}" title="Oldingi oy">‹</a>
+<select id="per" aria-label="Oy">{opts}</select>
+<a href="/hisobotlar?p={period_shift(nav, 1)}" title="Keyingi oy">›</a></div>
+<a class="btn ghost" href="/hisobotlar.csv?p={nav}">{ic("download")}Excel</a>
+<button class="btn" id="addCo">{ic("plus")}Mijoz</button>
+<button class="btn ghost" id="trashBtn" title="Olib tashlangan korxonalar">{ic("trash")}Karzina · {len(trash)}</button></div></header>
 {fl}
 <div class="kpis">
 <div class="kpi glass a"><span>Topshirilishi kerak</span><b>{tot['need']}</b></div>
@@ -2075,7 +2395,8 @@ def render_matrix(per, flash=""):
 <div class="kpi glass {'r' if m['overdue'] else 'o'}"><span>{'Qarz (muddat o‘tgan)' if m['overdue'] else 'Qolgan'}</span><b>{tot['missing']}</b></div>
 <div class="kpi glass o"><span>Xato yoki kech</span><b>{tot['bad']}</b></div>
 </div>
-<p class="sub" style="margin:10px 4px 0">{period_label(per)} davri hisobotlari · muddat taxminan {due:%d.%m.%Y} gacha ·
+<p class="sub" style="margin:10px 4px 0">{period_label(nav)} oyida topshiriladigan <b>{period_label(per)}</b> davri hisobotlari ·
+muddat taxminan {due:%d.%m.%Y} gacha ·
 hodimlar soliq.uz da “Отправить” bosgach katak o‘zi to‘ladi</p>
 <h2>Hodimlar bo‘yicha</h2>
 <div class="staff">{staff_cards or '<div class="sub">Ma’lumot yo‘q</div>'}</div>
@@ -2089,7 +2410,7 @@ hodimlar soliq.uz da “Отправить” bosgach katak o‘zi to‘ladi</p>
 Soliq katagini bosing — soliq.uz dan kelgan hamma ma’lumot va o‘zgartirish. Yashil — topshirilgan, sariq — tekshiruvda,
 to‘q sariq — kech, qizil — xato, qizil ramka — qarz.</p>
 <div class="card glass"><table class="sheet"><thead><tr><th class="l">№</th><th class="co l">Наименование организации</th>
-<th class="l">Вид деятельности</th><th class="l">ИНН</th><th class="l">Ходимлар</th><th class="l">1C</th>
+<th class="l">Вид деятельности</th><th class="l">ИНН</th><th class="l">Рейтинг</th><th class="l">Ходимлар</th><th class="l">1C</th>
 <th class="l">Солиқ режими</th><th class="l">Период</th>{head}
 {'<th class="l">Бошқа ҳисоботлар</th>' if m['other'] else ''}<th class="l">Изоҳ</th><th></th></tr></thead>
 <tbody>{''.join(body) or '<tr><td colspan="24" class="mut">Korxonalar yo‘q — “+ Mijoz” tugmasini bosing</td></tr>'}</tbody></table></div>
@@ -2100,7 +2421,7 @@ hamma hisobotlar — har bir maydon bilan (oxirgi holati).</p>
 <div class="card glass"><table class="log"><thead><tr><th class="l">Bot qabul qildi</th><th class="l">Korxona</th><th class="l">ИНН</th>
 <th class="l">Yuborgan hodim</th><th class="l">Jadval ustuni</th>{log_head}</tr></thead>
 <tbody>{''.join(log_rows) or '<tr><td colspan="19" class="mut">Bu davr uchun hali hisobot kelmagan</td></tr>'}</tbody></table></div>
-<p style="margin-top:10px"><a class="btn ghost" href="/hisobotlar.csv?p={per}&amp;t=log">⬇ Bu ro‘yxatni Excel’ga</a></p>
+<p style="margin-top:10px"><a class="btn ghost" href="/hisobotlar.csv?p={nav}&amp;t=log">{ic("download")}Bu ro‘yxatni Excel’ga</a></p>
 </div>
 </div>
 <div id="menu" hidden><div class="mh"></div><div class="info"></div>
@@ -2113,6 +2434,11 @@ hamma hisobotlar — har bir maydon bilan (oxirgi holati).</p>
 <button data-v="obl:never">umuman topshirmaydi</button></div></div>
 <div id="pick" hidden><div class="mh"></div><div class="opts"></div>
 <form><input placeholder="Boshqa matn yozing…" maxlength="40"><button>OK</button></form></div>
+<dialog id="dTrash" class="wide"><h3>Karzina</h3>
+<p class="sub" style="margin:0 0 12px">Bu korxonalar jadvalda ko‘rinmaydi va ular haqida botga xabar kelmaydi.
+“Qaytarish” — ro‘yxatga qaytadi; “Butunlay o‘chirish” — hamma ma’lumoti bilan o‘chadi.</p>
+<div class="trash"><table>{trash_rows or '<tr><td class="mut">Karzina bo‘sh</td></tr>'}</table></div>
+<div class="acts"><button type="button" class="btn ghost full" data-close>Yopish</button></div></dialog>
 <dialog id="dAdd"><h3>Yangi mijoz</h3>
 <form method="post" action="/dashboard/company" style="margin-top:14px">{hidden}<input type="hidden" name="act" value="add">
 <label>INN<input type="text" name="inn" required pattern="[0-9]{{9}}|[0-9]{{14}}" inputmode="numeric" placeholder="309497371"></label>
@@ -2120,12 +2446,11 @@ hamma hisobotlar — har bir maydon bilan (oxirgi holati).</p>
 <label>Faoliyat turi<input type="text" name="activity" maxlength="80" placeholder="Улгурчи савдо"></label>
 <label>Hodim<select name="uid"><option value="">— biriktirilmagan</option>{emp_opts}</select></label>
 <label>Солиқ режими<input type="text" name="regime" maxlength="40" list="dlReg" placeholder="Айланма"></label>
-<label>Период<select name="perk"><option value=""></option>{perk_opts}</select></label>
 <datalist id="dlReg">{reg_opts}</datalist>
 <div class="sub">Har oy topshiradigan hisobotlari:</div><div class="taxpick">{tax_checks}</div>
 <div class="acts"><button type="button" class="btn ghost" data-close>Bekor</button><button class="btn">Qo‘shish</button></div>
 </form></dialog>
-<script>const PERIOD="{per}",PERIOD_LABEL="{period_label(per)}",CSRF="{CSRF}",PICKS={picks_js};{MATRIX_JS}</script></body></html>"""
+<script>const PERIOD="{per}",NAV="{nav}",PERIOD_LABEL="{period_label(per)}",CSRF="{CSRF}",PICKS={picks_js};{MATRIX_JS}</script></body></html>"""
 
 
 def _csv_line(vals):
@@ -2136,8 +2461,9 @@ def _csv_line(vals):
     return ";".join(out)
 
 
-def matrix_csv(per, kind=""):
-    """Jadval (yoki bot olgan hisobotlar ro'yxati) — Excel ochadigan CSV (UTF-8 BOM, ';')."""
+def matrix_csv(nav, kind=""):
+    """Jadval (yoki bot olgan hisobotlar ro'yxati) — Excel ochadigan CSV (UTF-8 BOM, ';'). nav — topshirish oyi."""
+    per = period_shift(nav, -1)
     if kind == "log":
         lines = [_csv_line(["Bot qabul qildi", "Korxona", "ИНН", "Yuborgan hodim", "Jadval ustuni"] + LOG_FIELDS)]
         for r, d in period_reports(per):
@@ -2147,7 +2473,8 @@ def matrix_csv(per, kind=""):
                                    + [d.get(f) for f in LOG_FIELDS]))
         return "﻿" + "\r\n".join(lines) + "\r\n"
     m = period_matrix(per)
-    lines = [_csv_line(["№", "Наименование организации", "Вид деятельности", "ИНН", "Ходимлар", "1C", "Солиқ режими", "Период"]
+    lines = [_csv_line(["№", "Наименование организации", "Вид деятельности", "ИНН", "Рейтинг", "Ходимлар", "1C",
+                        "Солиқ режими", "Период"]
                        + [x for _k, _n, x in TAXES] + ["Изоҳ"])]
     for i, r in enumerate(m["rows"], 1):
         c = r["c"]
@@ -2155,8 +2482,8 @@ def matrix_csv(per, kind=""):
         for k, _n, _x in TAXES:
             ce = r["cells"][k]
             vals.append(ce.get("detail") if ce["st"] == "note" else ("йук" if ce.get("never") else WORDS.get(ce["st"], "")))
-        lines.append(_csv_line([i, c["name"], c.get("activity"), c["inn"], r["staff"], c.get("c1"), c.get("regime"),
-                                c.get("perk")] + vals + [c.get("note")]))
+        lines.append(_csv_line([i, c["name"], c.get("activity"), c["inn"], c.get("rating"), r["staff"], c.get("c1"),
+                                c.get("regime"), period_label(per)] + vals + [c.get("note")]))
     return "﻿" + "\r\n".join(lines) + "\r\n"
 
 
@@ -2225,6 +2552,11 @@ def matrix_post(path, f, fl):
     if act == "hide":
         q("UPDATE companies SET active=0 WHERE inn=?", (inn,))
         return "co_hidden"
+    if act == "restore":
+        activate_company(inn)
+        return "co_restored"
+    if act == "purge":
+        return "co_purged" if purge_company(inn) else "stale"
     if act == "add":
         uid = int(f["uid"]) if f.get("uid", "").isdigit() else None
         e_ = emp(uid) if uid else None
@@ -2235,11 +2567,14 @@ def matrix_post(path, f, fl):
           (inn, clip("name", 120), clip("activity", 80), e_["name"] if e_ else "", clip("regime", 40), clip("perk", 40)))
         if e_:
             per = f.get("p", "")
-            day = per + "-01" if re.match(r"^\d{4}-(0[1-9]|1[0-2])$", per) else now().date().isoformat()
+            # p — tepadagi (topshirish) oyi; biriktirish jadvaldagi davr boshidan (bir oy oldin)
+            day = (period_shift(per, -1) + "-01" if re.match(r"^\d{4}-(0[1-9]|1[0-2])$", per)
+                   else now().date().isoformat())
             set_owner(inn, uid, day)
         for t in fl.get("tax", []):
             if t in TAX_NAME:
                 q("INSERT OR REPLACE INTO obligations(inn,tax,required,freq,source) VALUES(?,?,1,'m','manual')", (inn, t))
+        backfill_filings(inn)   # avval kelgan hisobotlari bo'lsa — jadvalga tushadi
         return "co_add"
     return "stale"
 
@@ -2249,7 +2584,7 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def _out(self, code, body, ctype="application/json; charset=utf-8", extra=None):
-        data = body.encode() if isinstance(body, str) else json.dumps(body).encode()
+        data = body if isinstance(body, bytes) else body.encode() if isinstance(body, str) else json.dumps(body).encode()
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
@@ -2274,7 +2609,10 @@ class Handler(BaseHTTPRequestHandler):
         return m.value if m else ""
 
     def _session(self, touch=False):
-        """Joriy sessiya tugash vaqti (unix) yoki None."""
+        """Joriy sessiya tugash vaqti (unix) yoki None. Bloklangan IP dan — hech qachon."""
+        if self._ip() in blocked_ips():
+            session_end(self._cookie())
+            return None
         return session_valid(self._cookie(), touch)
 
     def _go(self, location, cookie=None):
@@ -2291,8 +2629,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def _login_post(self, raw):
         ip, t = self._ip(), time.time()
+        if ip in blocked_ips():
+            log("LOGIN BLOKLANGAN IP", ip)
+            return self._go("/login?e=denied")
         fails = [x for x in LOGIN_FAILS.get(ip, []) if x > t - FAIL_WINDOW]
-        if len(fails) >= MAX_FAILS:
+        # Umumiy chegara ham: har xil IP lardan parol tanlansa (IP almashtirib) — 1 soatda 30 ta xatodan keyin hamma uchun yopiq
+        glob = [x for x in LOGIN_FAILS.get("*", []) if x > t - 3600]
+        LOGIN_FAILS["*"] = glob
+        if len(fails) >= MAX_FAILS or len(glob) >= 30:
             LOGIN_FAILS[ip] = fails
             return self._go("/login?e=blocked")
         f = {k: v[0] for k, v in urllib.parse.parse_qs(raw.decode("utf-8", "replace")).items()}
@@ -2301,17 +2645,35 @@ class Handler(BaseHTTPRequestHandler):
         if not ok:
             fails.append(t)
             LOGIN_FAILS[ip] = fails
+            glob.append(t)
             log("LOGIN XATO", ip)
+            if len(glob) in (5, 15, 30):
+                send(OWNER, f"⚠️ Dashboardga {len(glob)} marta noto'g'ri parol bilan kirishga urinildi (oxirgi 1 soat, IP {esc(ip)})."
+                            + (" Kirish 1 soatga yopildi." if len(glob) >= 30 else ""))
             return self._go("/login?e=bad")
         LOGIN_FAILS.pop(ip, None)
         token = session_new()
         log("LOGIN", ip)
+        # Har muvaffaqiyatli kirish haqida rahbarga xabar — begona odam kirsa darhol bilinadi
+        ua = self.headers.get("User-Agent", "")
+        dev = next((n for k, n in (("iPhone", "iPhone"), ("iPad", "iPad"), ("Android", "Android"), ("Windows", "Windows"),
+                                   ("Mac OS", "Mac"), ("Linux", "Linux")) if k in ua), "noma'lum qurilma")
+        brw = next((n for k, n in (("Edg/", "Edge"), ("YaBrowser", "Yandex"), ("OPR/", "Opera"), ("Chrome/", "Chrome"),
+                                   ("Firefox/", "Firefox"), ("Safari/", "Safari")) if k in ua), "")
+        lid = secrets.token_hex(4)
+        LOGINS[lid] = {"token": token, "ip": ip}
+        for k in list(LOGINS)[:-50]:          # faqat oxirgi 50 ta kirish eslab qolinadi
+            LOGINS.pop(k, None)
+        send_kb(OWNER, f"🔐 Dashboardga kirildi: {now():%d.%m %H:%M} · {esc(dev)}{(' · ' + brw) if brw else ''} · IP {esc(ip)}\n"
+                       f"Bu siz bo'lmasangiz — pastdagi tugmani bosing.",
+                [[("🚫 Chiqarib yuborish va bloklash", f"lkick:{lid}")],
+                 [("✅ Bu men", f"lok:{lid}"), ("🚪 Hammani chiqarish", "lall")]])
         # Max-Age yo'q: brauzer yopilsa cookie o'chadi; muddatni server nazorat qiladi
         self._go("/dashboard", f"{SESSION_COOKIE}={token}; Path=/; HttpOnly; Secure; SameSite=Strict")
 
     def _dashboard_post(self, raw):
         path = self.path.split("?")[0]
-        is_api = path == "/dashboard/api/edit"
+        is_api = path == "/dashboard/api/edit" or (path == "/dashboard/pc" and b"ajax=1" in raw)
         if not self._session(touch=True):
             if is_api:
                 return self._out(401, {"ok": False, "error": "Sessiya tugagan — sahifani yangilab, qayta kiring"})
@@ -2323,6 +2685,10 @@ class Handler(BaseHTTPRequestHandler):
             if is_api:
                 return self._out(403, {"ok": False, "error": "Sahifa eskirgan — yangilang (F5)"})
             return self._redirect("stale")
+        if path == "/dashboard/pc":
+            if f.get("ajax") == "1":
+                return self._out(200, st.dashboard_json(f))
+            return self._go(st.dashboard_post(f))
         if is_api:
             try:
                 return self._out(200, matrix_api(f))
@@ -2331,7 +2697,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._out(500, {"ok": False, "error": "Server xatosi — qayta urining"})
         if path == "/dashboard/company":
             per = f.get("p", "")
-            per = per if re.match(r"^\d{4}-(0[1-9]|1[0-2])$", per) else default_period()
+            per = per if re.match(r"^\d{4}-(0[1-9]|1[0-2])$", per) else f"{now():%Y-%m}"
             return self._go(f"/hisobotlar?p={per}&m={matrix_post(path, f, fl)}")
         if path == "/dashboard/add_employee":
             uid, name = f.get("tg_id", "").strip(), " ".join(f.get("name", "").split())[:80]
@@ -2388,9 +2754,32 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         try:
             n = int(self.headers.get("Content-Length") or 0)
-            raw = self.rfile.read(min(n, 200_000))
+            limit = (13_000_000 if self.path == "/api/shot" else 3_000_000 if self.path == "/api/frame"
+                     else 2_000_000 if self.path == "/api/activity" else 200_000)
+            if n > limit:
+                return self._out(413, {"error": "too large"})
+            raw = self.rfile.read(n)
         except Exception:
             return self._out(400, {"error": "bad request"})
+        if self.path == "/api/frame":   # jonli ekran kadri (agentdan, JPEG) — logga yozilmaydi
+            try:
+                code, res = st.api_frame(self.headers, raw)
+            except Exception:
+                log("FRAME ERROR", traceback.format_exc())
+                code, res = 400, {"error": "bad request"}
+            return self._out(code, res)
+        if self.path in ("/api/activity", "/api/shot", "/api/wait", "/api/presence"):
+            # Hodim kompyuteridagi agent (har 30 soniyada + doimiy kutish so'rovi) — logga yozilmaydi
+            try:
+                body = json.loads(raw or b"{}")
+                fn = {"/api/activity": lambda: st.api_activity(body, self._ip()), "/api/shot": lambda: st.api_shot(body),
+                      "/api/wait": lambda: st.api_wait(body, self._ip()),
+                      "/api/presence": lambda: st.api_presence(body)}[self.path]
+                code, res = fn()
+            except Exception:
+                log("AGENT API ERROR", traceback.format_exc())
+                code, res = 400, {"error": "bad request"}
+            return self._out(code, res)
         if self.path.split("?")[0] == "/login":
             return self._login_post(raw)
         if self.path.startswith("/dashboard/"):
@@ -2404,6 +2793,17 @@ class Handler(BaseHTTPRequestHandler):
             "inn:", body.get("inn"), "hisobot:", (body.get("rec") or {}).get("№ Отчета"))
         if self.path == "/api/ping":
             return self._out(200, {"ok": True, "name": e["name"]}) if e else self._out(401, {"error": "bad key"})
+        if self.path == "/api/rating":
+            # soliq.uz kabinetidagi "Рейтинг: C - 34" (hodimlar skripti o'zi topib yuboradi)
+            if not e:
+                return self._out(401, {"error": "bad key"})
+            inn = "".join(ch for ch in str(body.get("inn") or "") if ch.isdigit())
+            g, _t = rating_grade(body.get("rating"))
+            num = re.search(r"\d{1,3}", str(body.get("rating") or ""))
+            if len(inn) in (9, 14) and g:
+                q("UPDATE companies SET rating=?, rating_ts=? WHERE inn=? AND COALESCE(active,1)=1",
+                  (f"{g} - {num.group(0)}" if num else g, now().isoformat(), inn))
+            return self._out(200, {"ok": True})
         if self.path == "/api/report":
             if not e:
                 return self._out(401, {"error": "bad key"})
@@ -2421,6 +2821,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._out(404, "not found", "text/plain")
             url = current_url()
             js = re.sub(r"const SERVER_URL\s*=\s*'[^']*'", f"const SERVER_URL    = '{url}'", js, count=1)
+            js = re.sub(r"const DISCOVERY_URL\s*=\s*'[^']*'", f"const DISCOVERY_URL = '{DISC_URL}'", js, count=1)
+            js = re.sub(r"const DISCOVERY_KEY\s*=\s*'[^']*'", f"const DISCOVERY_KEY = '{DISC_SECRET}'", js, count=1)
             # Tampermonkey shu manzildan yangilanishlarni o'zi tekshirsin
             js = js.replace("// ==/UserScript==", f"// @updateURL    {url}/skript.user.js\n"
                                                    f"// @downloadURL  {url}/skript.user.js\n// ==/UserScript==", 1)
@@ -2434,7 +2836,20 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/logout":
             session_end(self._cookie())
             return self._go("/login?e=out", f"{SESSION_COOKIE}=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict")
-        if path not in ("/", "/dashboard", "/hisobotlar", "/hisobotlar.csv"):
+        if path in ("/brand/logo.png", "/brand/logo-w.png"):
+            try:
+                with open(os.path.join(BASE, "static", path.rsplit("/", 1)[1]), "rb") as f:
+                    return self._out(200, f.read(), "image/png", {"Cache-Control": "public, max-age=604800"})
+            except OSError:
+                return self._out(404, "not found", "text/plain")
+        if path.startswith("/agent/"):
+            # Agent o'rnatish fayllari — maxfiy narsa yo'q (hodim kaliti o'rnatishda so'raladi)
+            got = st.agent_file(path[len("/agent/"):])
+            if not got:
+                return self._out(404, "not found", "text/plain")
+            return self._out(200, got[0], got[1], {"Cache-Control": "no-store"})
+        if path not in ("/", "/dashboard", "/hisobotlar", "/hisobotlar.csv", "/screentime", "/screentime/shot",
+                        "/screentime/live.json", "/screentime/detail.json", "/screentime/frame"):
             return self._out(404, "not found", "text/plain")
         # Avto-yangilanish (har daqiqa) faollik hisoblanmaydi — faqat foydalanuvchi sahifada nimadir qilgan bo'lsa.
         auto = qs.get("auto", [""])[0] == "1"
@@ -2442,9 +2857,37 @@ class Handler(BaseHTTPRequestHandler):
         exp = self._session(touch=(not auto) or active)
         if not exp:
             return self._go("/login?e=expired" if self._cookie() else "/login")
+        if path == "/screentime/live.json":
+            return self._out(200, st.live_data(), extra={"Cache-Control": "no-store"})
+        if path == "/screentime/frame":
+            pid, after = qs.get("id", [""])[0], qs.get("after", ["0"])[0]
+            if not pid.isdigit():
+                return self._out(400, "bad id", "text/plain")
+            got = st.frame_get(int(pid), int(after) if after.isdigit() else 0)
+            if not got:
+                self.send_response(204)
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                return
+            return self._out(200, got[1], "image/jpeg", {"Cache-Control": "no-store", "X-Seq": str(got[0])})
+        if path == "/screentime/detail.json":
+            tg_s, day = qs.get("tg", [""])[0], parse_day(qs.get("d", [""])[0] or "") or now().date().isoformat()
+            if not tg_s.isdigit():
+                return self._out(400, {"error": "bad tg"})
+            return self._out(200, st.detail_data(int(tg_s), day), extra={"Cache-Control": "no-store"})
+        if path == "/screentime/shot":
+            pid = qs.get("id", [""])[0]
+            png = st.shot_png(int(pid)) if pid.isdigit() else None
+            if not png:
+                return self._out(404, "not found", "text/plain")
+            return self._out(200, png, "image/png", {"Cache-Control": "no-store"})
+        if path == "/screentime":
+            day = qs.get("d", [""])[0]
+            day = parse_day(day) if day else None
+            return self._out(200, st.render_page(day, qs.get("m", [""])[0]), "text/html; charset=utf-8")
         if path in ("/hisobotlar", "/hisobotlar.csv"):
-            per = qs.get("p", [""])[0]
-            per = per if re.match(r"^\d{4}-(0[1-9]|1[0-2])$", per) else default_period()
+            per = qs.get("p", [""])[0]   # tepadagi oy (topshirish oyi); standart — joriy oy
+            per = per if re.match(r"^\d{4}-(0[1-9]|1[0-2])$", per) else f"{now():%Y-%m}"
             if path.endswith(".csv"):
                 kind = "log" if qs.get("t", [""])[0] == "log" else ""
                 return self._out(200, matrix_csv(per, kind), "text/csv; charset=utf-8",
@@ -2454,9 +2897,35 @@ class Handler(BaseHTTPRequestHandler):
         self._out(200, render_dashboard(qs.get("m", [""])[0]), "text/html; charset=utf-8")
 
 
+class DiscoveryHandler(BaseHTTPRequestHandler):
+    """Doimiy IP dagi yagona sahifa: GET /u -> {"url": joriy tunnel manzili, "sig": HMAC}. Boshqa hech narsa yo'q."""
+    def log_message(self, *a):
+        pass
+
+    def do_GET(self):
+        if self.path.split("?")[0] != "/u":
+            self.send_response(404)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        url = current_url()
+        sig = __import__("hmac").new(DISC_SECRET.encode(), url.encode(), "sha256").hexdigest()
+        data = json.dumps({"url": url, "sig": sig}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+
 def main():
+    if DISC_PORT:
+        dsrv = ThreadingHTTPServer(("0.0.0.0", DISC_PORT), DiscoveryHandler)
+        threading.Thread(target=dsrv.serve_forever, daemon=True).start()
     if not DASH_PASSWORD:
         print("⚠️  config.json: DASHBOARD_PASSWORD bo'sh — dashboard ochilmaydi.")
+    st.init(globals())
     backfill_filings()
     # Serverda "BIND": "127.0.0.1" — dashboardga faqat tunnel orqali kiriladi
     server = ThreadingHTTPServer((CFG.get("BIND", "0.0.0.0"), PORT), Handler)

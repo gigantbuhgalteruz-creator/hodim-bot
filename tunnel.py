@@ -41,10 +41,11 @@ def save_url(url):
 
 
 def publish_url(cfg, url):
-    """Manzilni bot profilining qisqa tavsifiga yozadi — hodimlar skripti uni t.me/<bot> sahifasidan o'qiydi."""
+    """Bot profilidagi qisqa tavsif — server manzili endi YOZILMAYDI (hodimlar ko'rmasin).
+    Agent va skript yangi manzilni serverning doimiy IP manzilidagi /u dan (imzolangan) oladi."""
     req = urllib.request.Request(
         f"https://api.telegram.org/bot{cfg['BOT_TOKEN']}/setMyShortDescription",
-        data=json.dumps({"short_description": f"Hodimlar davomati va hisobotlar. Server: {url}"}).encode(),
+        data=json.dumps({"short_description": "Hodimlar davomati va hisobotlar."}).encode(),
         headers={"Content-Type": "application/json"})
     for _ in range(5):
         try:
@@ -59,7 +60,7 @@ def publish_url(cfg, url):
 def notify(cfg, url):
     text = (f"🌐 <b>Server manzili yangilandi</b>\n{url}\n\n"
             f"📈 Dashboard: {url}/dashboard\n\n"
-            f"Hodimlar skripti (v3.4+) yangi manzilni o'zi topadi — hech narsa qilish shart emas.")
+            f"Hodimlar skripti (v3.6+) va kompyuter agenti yangi manzilni o'zi topadi — hech narsa qilish shart emas.")
     req = urllib.request.Request(
         f"https://api.telegram.org/bot{cfg['BOT_TOKEN']}/sendMessage",
         data=json.dumps({"chat_id": int(cfg["OWNER_ID"]), "text": text, "parse_mode": "HTML",
