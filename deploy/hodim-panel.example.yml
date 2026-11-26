@@ -1,0 +1,6 @@
+tunnel: <TUNNEL_ID>
+credentials-file: /etc/cloudflared/hodim-panel.json
+ingress:
+  - hostname: panel.gigantbuxgalter.com
+    service: http://localhost:8080
+  - service: http_status:404

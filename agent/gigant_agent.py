@@ -26,7 +26,7 @@ import urllib.error
 import urllib.request
 import zlib
 
-VERSION = "1.4"
+VERSION = "1.5"
 SAMPLE_SEC = 5          # necha soniyada bir tekshiriladi
 FLUSH_SEC = 30          # necha soniyada serverga yuboriladi
 IDLE_LIMIT = 180        # shuncha soniya klaviatura/sichqoncha tegilmasa — "harakatsiz"
@@ -745,7 +745,8 @@ class Client:
                 d = json.loads(r.read() or b"{}")
             url = str(d.get("url") or "")
             good = hmac.new(dkey.encode(), url.encode(), "sha256").hexdigest()
-            if re.match(r"^https://[a-z0-9-]+\.trycloudflare\.com$", url) and hmac.compare_digest(good, str(d.get("sig"))):
+            if re.match(r"^https://([a-z0-9-]+\.trycloudflare\.com|panel\.gigantbuxgalter\.com)$", url) and \
+                    hmac.compare_digest(good, str(d.get("sig"))):
                 return url
             log("Manzil imzosi noto'g'ri — e'tiborsiz")
         except Exception:

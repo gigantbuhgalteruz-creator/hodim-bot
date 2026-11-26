@@ -12,7 +12,7 @@ function Get-Server {
         $d = Invoke-RestMethod "$($conf.disc)?_=$([DateTimeOffset]::Now.ToUnixTimeSeconds())" -TimeoutSec 20
         $h = New-Object System.Security.Cryptography.HMACSHA256 (, [Text.Encoding]::UTF8.GetBytes($conf.dkey))
         $sig = -join ($h.ComputeHash([Text.Encoding]::UTF8.GetBytes($d.url)) | ForEach-Object { $_.ToString('x2') })
-        if ($sig -eq $d.sig -and $d.url -match '^https://[a-z0-9-]+\.trycloudflare\.com$') { return $d.url }
+        if ($sig -eq $d.sig -and $d.url -match '^https://([a-z0-9-]+\.trycloudflare\.com|panel\.gigantbuxgalter\.com)$') { return $d.url }
     } catch {}
     return $conf.server
 }
