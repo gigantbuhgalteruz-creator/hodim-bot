@@ -776,6 +776,29 @@ def add_employee(uid, name):
                      + script_help(key) + "\n\n/key — shu ko'rsatmani qayta ko'rish")
 
 
+def join_request(uid, frm):
+    """Ro'yxatda yo'q odam botga yozdi: rahbarga "Qo'shish" tugmasi bilan so'rov (12 soatda bir marta)."""
+    name = " ".join(x for x in (frm.get("first_name"), frm.get("last_name")) if x).strip() or str(uid)
+    user = frm.get("username") or ""
+    old = q("SELECT v FROM meta WHERE k=?", (f"join:{uid}",), one=True)
+    fresh = False
+    if old:
+        try:
+            fresh = (now() - datetime.fromisoformat(json.loads(old["v"])["ts"])).total_seconds() < 12 * 3600
+        except (ValueError, KeyError):
+            pass
+    send(uid, "👋 Assalomu alaykum!\nSo'rovingiz rahbarga yuborildi. Tasdiqlangach shu yerga "
+              "soliq.uz skripti uchun <b>kalit</b> va yo'riqnoma keladi.\n"
+              f"Sizning Telegram ID: <code>{uid}</code>")
+    if fresh:
+        return
+    q("INSERT OR REPLACE INTO meta(k,v) VALUES(?,?)",
+      (f"join:{uid}", json.dumps({"name": name, "user": user, "ts": now().isoformat()})))
+    send_kb(OWNER, f"🆕 Botga yangi odam yozdi: <b>{esc(name)}</b>"
+                   + (f" (@{esc(user)})" if user else "") + f"\nID: <code>{uid}</code>\nHodim sifatida qo'shilsinmi?",
+            [[("➕ Qo'shish", f"join:{uid}"), ("❌ Yo'q", f"joinno:{uid}")]])
+
+
 def parse_companies(text):
     """'INN Firma nomi' qatorlari -> ([(inn, nom)], [noto'g'ri qatorlar])."""
     items, bad = [], []
@@ -992,6 +1015,23 @@ def handle_callback(cq):
         do_fire(int(p[1]), int(p[2]), p[3])
     elif p[0] == "hist" and len(p) == 2:
         send(OWNER, history_text(uid=int(p[1])))
+    elif p[0] in ("join", "joinno") and len(p) == 2 and p[1].isdigit():
+        uid = int(p[1])
+        row = q("SELECT v FROM meta WHERE k=?", (f"join:{uid}",), one=True)
+        q("DELETE FROM meta WHERE k=?", (f"join:{uid}",))
+        if emp(uid):
+            return send(OWNER, f"{esc(emp_name(uid))} allaqachon ro'yxatda.")
+        if not row:
+            return send(OWNER, "Bu so'rov eskirgan yoki allaqachon ko'rib chiqilgan.")
+        name = (json.loads(row["v"]).get("name") or str(uid))[:60]
+        if p[0] == "joinno":
+            send(uid, "Rahbar so'rovingizni tasdiqlamadi.")
+            return send(OWNER, f"❌ {esc(name)} qo'shilmadi.")
+        delivered = add_employee(uid, name)
+        send_kb(OWNER, f"✅ <b>{esc(name)}</b> hodim sifatida qo'shildi (ID {uid}).\n"
+                       + ("Unga skript kaliti va yo'riqnoma yuborildi." if delivered else "⚠️ Unga xabar yetmadi.")
+                       + f"\nIsmini o'zgartirish: <code>/add {uid} Ism Familiya</code>",
+                [[("➕ Korxona biriktirish", f"asg:{uid}")]])
     elif data == "cancel":
         PENDING.clear()
         send(OWNER, "Bekor qilindi.")
@@ -1238,8 +1278,7 @@ def handle_update(u):
     e = emp(uid)
     if not e:
         if uid != OWNER:
-            send(uid, f"Siz hali ro'yxatda yo'qsiz.\nSizning Telegram ID: <code>{uid}</code>\n"
-                      f"Shu raqamni rahbaringizga yuboring.")
+            join_request(uid, msg.get("from", {}))
         return
     if "video_note" in msg:
         return handle_video(msg, e)
