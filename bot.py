@@ -855,6 +855,15 @@ def activate_company(inn):
     q("UPDATE companies SET active=1, sort=COALESCE(sort,(SELECT COALESCE(MAX(sort),0)+1 FROM companies)) "
       "WHERE inn=?", (inn,))
     backfill_filings(inn)
+    apply_saved_rating(inn)
+
+
+def apply_saved_rating(inn):
+    """Korxona ro'yxatga qo'shilishidan oldin kelgan reytingni jadvalga yozadi."""
+    r = q("SELECT v FROM meta WHERE k=?", (f"rating:{inn}",), one=True)
+    if r:
+        q("UPDATE companies SET rating=COALESCE(NULLIF(rating,''),?), rating_ts=COALESCE(rating_ts,?) WHERE inn=?",
+          (r["v"], now().isoformat(), inn))
 
 
 def purge_company(inn):
@@ -2626,6 +2635,7 @@ def matrix_post(path, f, fl):
             if t in TAX_NAME:
                 q("INSERT OR REPLACE INTO obligations(inn,tax,required,freq,source) VALUES(?,?,1,'m','manual')", (inn, t))
         backfill_filings(inn)   # avval kelgan hisobotlari bo'lsa — jadvalga tushadi
+        apply_saved_rating(inn)
         return "co_add"
     return "stale"
 
@@ -2863,8 +2873,10 @@ class Handler(BaseHTTPRequestHandler):
             g, _t = rating_grade(body.get("rating"))
             num = re.search(r"\d{1,3}", str(body.get("rating") or ""))
             if len(inn) in (9, 14) and g:
-                q("UPDATE companies SET rating=?, rating_ts=? WHERE inn=? AND COALESCE(active,1)=1",
-                  (f"{g} - {num.group(0)}" if num else g, now().isoformat(), inn))
+                rv = f"{g} - {num.group(0)}" if num else g
+                q("UPDATE companies SET rating=?, rating_ts=? WHERE inn=?", (rv, now().isoformat(), inn))
+                # Korxona hali ro'yxatda bo'lmasa ham eslab qolamiz — qo'shilganda jadvalga o'zi tushadi
+                q("INSERT OR REPLACE INTO meta(k,v) VALUES(?,?)", (f"rating:{inn}", rv))
             pr = body.get("probe")
             if isinstance(pr, dict):               # reyting API sinovi natijasi (skriptdan)
                 log("RATING PROBE", json.dumps({k: str(v)[:1500] for k, v in pr.items()}, ensure_ascii=False))
