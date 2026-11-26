@@ -1105,6 +1105,7 @@ OWNER_HELP = f"""👑 <b>Owner buyruqlari</b>
 
 <b>Dashboard xavfsizligi</b>
 /chiqar — dashboarddagi hamma sessiyalarni yopish
+/qurilmalar — ishonchli qurilmalar (ulardan kirganda xabar kelmaydi)
 /ipblok — bloklangan IP lar (blokdan chiqarish)
 (sana: 01.11.2026; yozilmasa — bugundan)
 
@@ -1234,6 +1235,16 @@ def handle_owner(text):
         n = len(SESSIONS)
         SESSIONS.clear()
         send(OWNER, f"🚪 Dashboarddagi hamma sessiyalar yopildi ({n} ta).")
+    elif cmd == "/qurilmalar":
+        t = trusted_devices()
+        if not t:
+            send(OWNER, "Ishonchli qurilma yo'q. Dashboardga kirganda kelgan xabarda \"✅ Bu men\" ni bosing.")
+        else:
+            send_kb(OWNER, "📱 <b>Ishonchli qurilmalar</b> (ulardan kirganda xabar kelmaydi)\n"
+                    + "\n".join(f"• {esc(v.get('label', ''))} — {v.get('since', '')} dan, oxirgi: {v.get('last', '')}"
+                                for v in t.values())
+                    + "\n\nBosing — ro'yxatdan olib tashlanadi:",
+                    [[(f"🗑 {v.get('label', '')} ({v.get('since', '')})"[:60], f"ldel:{k[:16]}")] for k, v in t.items()])
     elif cmd == "/ipblok":
         ips = sorted(blocked_ips())
         if not ips:
@@ -1473,7 +1484,21 @@ def session_end(token):
 
 
 # Telegram'dagi kirish ogohlantirishidan rahbar begona kirishni chiqarib yuborishi va IP ni bloklashi mumkin
-LOGINS = {}     # qisqa id -> {"token", "ip"} (oxirgi kirishlar)
+LOGINS = {}     # qisqa id -> {"token", "ip", "dev", "label"} (oxirgi kirishlar)
+DEVICE_COOKIE = "hb_dev"
+
+
+def trusted_devices():
+    """Rahbar "✅ Bu men" degan qurilmalar: {qurilma_id: {"label", "since", "last"}}."""
+    r = q("SELECT v FROM meta WHERE k='trusted_devices'", one=True)
+    try:
+        return json.loads(r["v"]) if r else {}
+    except ValueError:
+        return {}
+
+
+def save_trusted(d):
+    q("INSERT OR REPLACE INTO meta(k,v) VALUES('trusted_devices',?)", (json.dumps(d, ensure_ascii=False),))
 
 
 def blocked_ips():
@@ -1492,13 +1517,30 @@ def login_callback(cq, data):
     """lkick:ID — shu kirishni chiqarish + IP blok; lall — hamma sessiyalarni yopish; lok:ID — bu men;
     lunb:IP — IP ni blokdan chiqarish. Tegishli bo'lsa True."""
     p = data.split(":", 1)
+    if p[0] == "ldel" and len(p) == 2:          # ishonchli qurilmani ro'yxatdan olib tashlash
+        t = trusted_devices()
+        key = next((k for k in t if k.startswith(p[1])), None)
+        if key:
+            lab = t.pop(key).get("label", "")
+            save_trusted(t)
+            send(OWNER, f"🗑 {esc(lab)} ishonchli ro'yxatdan olib tashlandi — keyingi kirishda yana xabar keladi.")
+        return True
     if p[0] not in ("lkick", "lall", "lok", "lunb"):
         return False
     mid = (cq.get("message") or {}).get("message_id")
     if mid and p[0] != "lunb":
         tg("editMessageReplyMarkup", chat_id=OWNER, message_id=mid, reply_markup={"inline_keyboard": []})
     if p[0] == "lok":
-        send(OWNER, "👍 Yaxshi, bu kirish sizniki deb belgilandi.")
+        info = LOGINS.pop(p[1], None) if len(p) == 2 else None
+        if info and info.get("dev"):
+            t = trusted_devices()
+            t[info["dev"]] = {"label": info.get("label", ""), "since": now().strftime("%d.%m.%Y"),
+                              "last": now().strftime("%d.%m.%Y %H:%M")}
+            save_trusted(t)
+            send(OWNER, f"👍 {esc(info.get('label', ''))} — ishonchli qurilma. Undan kirganda endi xabar kelmaydi.\n"
+                        f"Ro'yxat: /qurilmalar")
+        else:
+            send(OWNER, "👍 Yaxshi, bu kirish sizniki deb belgilandi.")
     elif p[0] == "lall":
         n = len(SESSIONS)
         SESSIONS.clear()
@@ -2599,13 +2641,13 @@ class Handler(BaseHTTPRequestHandler):
     def _ip(self):
         return self.headers.get("CF-Connecting-IP") or self.client_address[0]
 
-    def _cookie(self):
+    def _cookie(self, name=SESSION_COOKIE):
         c = http.cookies.SimpleCookie()
         try:
             c.load(self.headers.get("Cookie", ""))
         except Exception:
             return ""
-        m = c.get(SESSION_COOKIE)
+        m = c.get(name)
         return m.value if m else ""
 
     def _session(self, touch=False):
@@ -2620,8 +2662,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Location", location)
         self.send_header("Content-Length", "0")
         self.send_header("Cache-Control", "no-store")
-        if cookie:
-            self.send_header("Set-Cookie", cookie)
+        for ck in ([cookie] if isinstance(cookie, str) else (cookie or [])):
+            self.send_header("Set-Cookie", ck)
         self.end_headers()
 
     def _redirect(self, flash):
@@ -2660,16 +2702,27 @@ class Handler(BaseHTTPRequestHandler):
                                    ("Mac OS", "Mac"), ("Linux", "Linux")) if k in ua), "noma'lum qurilma")
         brw = next((n for k, n in (("Edg/", "Edge"), ("YaBrowser", "Yandex"), ("OPR/", "Opera"), ("Chrome/", "Chrome"),
                                    ("Firefox/", "Firefox"), ("Safari/", "Safari")) if k in ua), "")
-        lid = secrets.token_hex(4)
-        LOGINS[lid] = {"token": token, "ip": ip}
-        for k in list(LOGINS)[:-50]:          # faqat oxirgi 50 ta kirish eslab qolinadi
-            LOGINS.pop(k, None)
-        send_kb(OWNER, f"🔐 Dashboardga kirildi: {now():%d.%m %H:%M} · {esc(dev)}{(' · ' + brw) if brw else ''} · IP {esc(ip)}\n"
-                       f"Bu siz bo'lmasangiz — pastdagi tugmani bosing.",
-                [[("🚫 Chiqarib yuborish va bloklash", f"lkick:{lid}")],
-                 [("✅ Bu men", f"lok:{lid}"), ("🚪 Hammani chiqarish", "lall")]])
-        # Max-Age yo'q: brauzer yopilsa cookie o'chadi; muddatni server nazorat qiladi
-        self._go("/dashboard", f"{SESSION_COOKIE}={token}; Path=/; HttpOnly; Secure; SameSite=Strict")
+        # Qurilma belgisi (2 yillik cookie): "✅ Bu men" bosilgan qurilmadan kirilganda xabar kelmaydi
+        devid = self._cookie(DEVICE_COOKIE)
+        if not re.fullmatch(r"[A-Za-z0-9_-]{20,64}", devid or ""):
+            devid = secrets.token_urlsafe(24)
+        label = f"{dev}{(' · ' + brw) if brw else ''}"
+        trusted = trusted_devices()
+        if devid in trusted:
+            trusted[devid]["last"] = now().strftime("%d.%m.%Y %H:%M")
+            save_trusted(trusted)
+        else:
+            lid = secrets.token_hex(4)
+            LOGINS[lid] = {"token": token, "ip": ip, "dev": devid, "label": label}
+            for k in list(LOGINS)[:-50]:          # faqat oxirgi 50 ta kirish eslab qolinadi
+                LOGINS.pop(k, None)
+            send_kb(OWNER, f"🔐 <b>Yangi qurilmadan kirildi</b>: {now():%d.%m %H:%M} · {esc(label)} · IP {esc(ip)}\n"
+                           f"Bu siz bo'lsangiz — <b>✅ Bu men</b> ni bosing, shu qurilmadan boshqa xabar kelmaydi.",
+                    [[("🚫 Chiqarib yuborish va bloklash", f"lkick:{lid}")],
+                     [("✅ Bu men", f"lok:{lid}"), ("🚪 Hammani chiqarish", "lall")]])
+        # Sessiya cookie: Max-Age yo'q — brauzer yopilsa o'chadi; muddatni server nazorat qiladi
+        self._go("/dashboard", [f"{SESSION_COOKIE}={token}; Path=/; HttpOnly; Secure; SameSite=Strict",
+                                f"{DEVICE_COOKIE}={devid}; Path=/; Max-Age=63072000; HttpOnly; Secure; SameSite=Strict"])
 
     def _dashboard_post(self, raw):
         path = self.path.split("?")[0]
