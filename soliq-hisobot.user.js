@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Soliq.uz → Hodim bot: hisobotlar
 // @namespace    soliq-telegram
-// @version      4.0
+// @version      4.2
 // @description  Hodim soliq.uz kabinetida ishlayotganda hisobotlar jurnalini fonda tekshiradi va yangi/o'zgargan hisobotlarni bot serveriga yuboradi (bot ularni faqat ownerga jo'natadi).
 // @match        https://oldmy.soliq.uz/*
 // @match        https://my.soliq.uz/*
@@ -134,26 +134,46 @@
   }
   // ====== Korxona reytingi ("Рейтинг: C - 34") — topilsa serverga yuboriladi, jadvaldagi "Рейтинг" ustuniga tushadi ======
   const sentRating = {};
-  function ratingTick() {
-    if (!KEY) return;
+  const LAT = { 'А': 'A', 'В': 'B', 'С': 'C', 'Д': 'D', 'Е': 'E', 'Б': 'B' };
+  function findRatings() {
     const found = {};
     document.querySelectorAll('body *').forEach(el => {
       if (el.children.length > 3) return;
-      const m = (el.textContent || '').match(/(?:Рейтинг|Reyting)\s*:?\s*([A-EАВСЕ])\s*[-–]\s*(\d{1,3})/i);
+      const m = (el.textContent || '').match(/(?:Рейтинг|Reyting)\s*:?\s*([A-EАБВСДЕ])\s*[-–—]?\s*(\d{1,3})/i);
       if (!m || el.textContent.length > 80) return;
       let up = el;                                   // yaqin ota elementdan korxona STIR/INN ini topamiz
       for (let i = 0; i < 7 && up; i++, up = up.parentElement) {
         const inn = ((up.textContent || '').match(/(?:СТИР|STIR|ИНН|INN)\s*:?\s*(\d{9})/i) || [])[1]
                     || (up !== el && onNew ? ((up.textContent || '').match(/\b(\d{9})\b/) || [])[1] : null);
-        if (inn) { found[inn] = m[1] + ' - ' + m[2]; break; }
+        if (inn) { found[inn] = (LAT[m[1].toUpperCase()] || m[1].toUpperCase()) + ' - ' + m[2]; break; }
       }
     });
+    return found;
+  }
+  let ratingDiag = 'hali tekshirilmadi';
+  function ratingTick() {
+    if (!KEY) { ratingDiag = 'kalit kiritilmagan'; return; }
+    const found = findRatings();
+    ratingDiag = Object.keys(found).length ? 'topildi: ' + Object.entries(found).map(([i, r]) => i + ' → ' + r).join(', ')
+                                           : 'sahifada "Рейтинг" yozuvi topilmadi';
     for (const [inn, rating] of Object.entries(found)) {
       if (sentRating[inn] === rating) continue;
       sentRating[inn] = rating;
-      post('/api/rating', { inn, rating }).catch(() => { delete sentRating[inn]; });
+      // Diagnostika (bir martalik): yangi kabinet reytingni qaysi ichki manzildan olayotganini bilish uchun
+      // sahifa so'ragan API manzillari (faqat yo'li, parametrlarisiz) — keyin reytingni eski kabinetdan olishga kerak.
+      const endpoints = onNew ? [...new Set(performance.getEntriesByType('resource')
+        .filter(r => /fetch|xmlhttprequest/.test(r.initiatorType))
+        .map(r => { try { const u = new URL(r.name); return u.host + u.pathname; } catch (e) { return ''; } })
+        .filter(Boolean))].slice(0, 60) : [];
+      post('/api/rating', { inn, rating, endpoints })
+        .then(() => { ratingDiag += ' · serverga yuborildi ✔'; })
+        .catch(e => { delete sentRating[inn]; ratingDiag += ' · yuborishda xato: ' + e.message; });
     }
   }
+  GM_registerMenuCommand('⭐ Reytingni tekshirish', () => {
+    ratingTick();
+    setTimeout(() => alert(`Skript: v${GM_info.script.version}\nServer: ${serverUrl}\nReyting: ${ratingDiag}`), 1500);
+  });
   setTimeout(ratingTick, 3000);
   setInterval(ratingTick, 15000);
   if (onNew) return;    // yangi kabinetda boshqa ish yo'q

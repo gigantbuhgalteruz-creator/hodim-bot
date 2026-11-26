@@ -2321,7 +2321,7 @@ def period_reports(per):
 
 def rating_grade(r):
     """'С - 34' / 'A-80' -> ('C', 'C · 34'). Kirill harflar lotinga."""
-    s = str(r or "").strip().upper().translate(str.maketrans("АВСЕ", "ABCE"))
+    s = str(r or "").strip().upper().translate(str.maketrans("АБВСДЕ", "ABBCDE"))
     m = re.match(r"^([A-E])\s*[-–:·]?\s*(\d{1,3})?", s)
     if not m:
         return "", esc(r or "")
@@ -2864,6 +2864,9 @@ class Handler(BaseHTTPRequestHandler):
             if len(inn) in (9, 14) and g:
                 q("UPDATE companies SET rating=?, rating_ts=? WHERE inn=? AND COALESCE(active,1)=1",
                   (f"{g} - {num.group(0)}" if num else g, now().isoformat(), inn))
+            eps = body.get("endpoints")
+            if isinstance(eps, list) and eps:      # yangi kabinet API manzillari (reytingni avtomatlashtirish uchun)
+                log("RATING ENDPOINTS", json.dumps([str(x)[:150] for x in eps[:60]], ensure_ascii=False))
             return self._out(200, {"ok": True})
         if self.path == "/api/report":
             if not e:
@@ -2887,7 +2890,8 @@ class Handler(BaseHTTPRequestHandler):
             # Tampermonkey shu manzildan yangilanishlarni o'zi tekshirsin
             js = js.replace("// ==/UserScript==", f"// @updateURL    {url}/skript.user.js\n"
                                                    f"// @downloadURL  {url}/skript.user.js\n// ==/UserScript==", 1)
-            return self._out(200, js, "text/javascript; charset=utf-8")
+            # no-store: Cloudflare va brauzer keshlamasin — yangi versiya darhol tarqalsin
+            return self._out(200, js, "text/javascript; charset=utf-8", {"Cache-Control": "no-store, max-age=0"})
         path = self.path.split("?")[0]
         qs = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
         if path == "/login":
