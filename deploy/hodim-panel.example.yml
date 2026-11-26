@@ -3,4 +3,9 @@ credentials-file: /etc/cloudflared/hodim-panel.json
 ingress:
   - hostname: panel.gigantbuxgalter.com
     service: http://localhost:8080
+  # Hozircha asosiy domen ham dashboardni ochadi (keyin bu yerga firma sayti qo'yiladi)
+  - hostname: gigantbuxgalter.com
+    service: http://localhost:8080
+  - hostname: www.gigantbuxgalter.com
+    service: http://localhost:8080
   - service: http_status:404
