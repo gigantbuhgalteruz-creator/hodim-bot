@@ -2172,6 +2172,7 @@ $$('td.ed').forEach(td=>{
  td.onblur=async()=>{if(!td.isContentEditable)return;td.contentEditable='false';const v=td.textContent.trim();
   if(v===(td.dataset.old||'').trim()){td.textContent=td.dataset.old;return}
   try{const j=await api({kind:'co',inn:td.closest('tr').dataset.inn,field:td.dataset.f,v});td.textContent=j.text;
+   if(td.dataset.f==='rating')td.className='ed rt g'+(j.grade||'');
    td.classList.add('saved');setTimeout(()=>td.classList.remove('saved'),1300)}catch(e){td.textContent=td.dataset.old}}});
 // Soliq kataklari: bosing — tafsilot va tanlov
 const menu=$('#menu');let cur=null;
@@ -2551,10 +2552,17 @@ def matrix_api(f):
         val = (v.strip() if field == "note" else " ".join(v.split()))[:CO_FIELDS[field]]
         if field == "name" and not val:
             return {"ok": False, "error": "Korxona nomi bo'sh bo'lmasin"}
+        grade = ""
+        if field == "rating" and val:      # "c-34" / "С 34" -> "C - 34" (rangi harfdan)
+            grade, _t = rating_grade(val)
+            num = re.search(r"\d{1,3}", val)
+            if not grade:
+                return {"ok": False, "error": "Reyting A–E harfi bilan boshlansin, masalan: C - 34"}
+            val = f"{grade} - {num.group(0)}" if num else grade
         if not q("SELECT 1 FROM companies WHERE inn=?", (inn,), one=True):
             q("INSERT INTO companies(inn,name,tg_id) VALUES(?,'',NULL)", (inn,))
         q(f"UPDATE companies SET {field}=? WHERE inn=?", (val, inn))
-        return {"ok": True, "text": val}
+        return {"ok": True, "text": val, "grade": grade}
     tax = f.get("tax", "")
     if tax not in TAX_NAME:
         return {"ok": False, "error": "Soliq turi noto'g'ri"}
