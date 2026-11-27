@@ -1,10 +1,9 @@
 // ==UserScript==
 // @name         Soliq.uz → Hodim bot: hisobotlar
 // @namespace    soliq-telegram
-// @version      4.4
+// @version      5.0
 // @description  Hodim soliq.uz kabinetida ishlayotganda hisobotlar jurnalini fonda tekshiradi va yangi/o'zgargan hisobotlarni bot serveriga yuboradi (bot ularni faqat ownerga jo'natadi).
-// @match        https://oldmy.soliq.uz/*
-// @match        https://my.soliq.uz/*
+// @match        *://*/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
 // @grant        GM_setValue
@@ -35,6 +34,40 @@
   const JOURNAL_URL = '/wefo4-clientui/form/ru/reports/0';
   const clean = s => (s || '').replace(/\s+/g, ' ').trim();
   const txt = el => clean(el.textContent);
+
+  // ====== Saytlar bo'yicha aniq vaqt (Pixel "Digital Wellbeing" kabi) — HAMMA saytlarda ishlaydi ======
+  // Har 30 soniyada: tab ko'rinib turgan, brauzer oynasi faol va hodim oxirgi 3 daqiqada sichqoncha/klaviaturani
+  // ishlatgan bo'lsa — "shu saytda (domen + sahifa nomi) N soniya" serverga yuboriladi. Parollar, yozilgan matnlar
+  // va sahifa ichidagi ma'lumot O'QILMAYDI — faqat domen va tab sarlavhasi.
+  (function webTime() {
+    const host = location.hostname.replace(/^www\./, '').toLowerCase();
+    if (!host || location.protocol === 'file:' || /gigantbuxgalter\.com$/.test(host)) return;
+    let lastInput = Date.now(), lastBeat = Date.now(), focused = document.hasFocus();
+    ['mousemove', 'mousedown', 'keydown', 'wheel', 'touchstart'].forEach(ev =>
+      addEventListener(ev, () => { lastInput = Date.now(); }, { passive: true, capture: true }));
+    function base() {
+      const s = GM_getValue('server_url_v2', null);
+      return (s && s.url && /gigantbuxgalter\.com/.test(s.url)) ? s.url : 'https://gigantbuxgalter.com';
+    }
+    function beat(leaving) {
+      const now = Date.now(), secs = Math.round((now - lastBeat) / 1000);
+      lastBeat = now;
+      const key = GM_getValue('employee_key', '');
+      const active = (leaving === true ? focused : document.visibilityState === 'visible' && document.hasFocus())
+                     && now - lastInput < 180000;
+      if (!key || !active || secs < 5) return;
+      GM_xmlhttpRequest({ method: 'POST', url: base() + '/api/web', timeout: 15000,
+        headers: { 'Content-Type': 'application/json' },
+        data: JSON.stringify({ key, domain: host, title: clean(document.title).slice(0, 120), secs: Math.min(secs, 90) }) });
+    }
+    setInterval(beat, 30000);
+    addEventListener('focus', () => { lastBeat = Date.now(); focused = true; });
+    addEventListener('blur', () => { beat(true); focused = false; });
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState !== 'visible') beat(true); else lastBeat = Date.now(); });
+    addEventListener('pagehide', () => beat(true));
+  })();
+  if (!/(^|\.)soliq\.uz$/.test(location.hostname)) return;   // qolgan hamma narsa faqat soliq.uz uchun
 
   const myInn = (document.body.textContent.match(/ИНН:\s*(\d+)/) || [])[1];
   const onNew = location.hostname === 'my.soliq.uz';   // yangi kabinet — faqat korxona reytingini o'qiymiz

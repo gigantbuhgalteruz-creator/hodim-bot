@@ -1578,11 +1578,10 @@ LOGIN_MSG = {"bad": "Login yoki parol noto‘g‘ri", "expired": "1 soat harakat
 
 
 # ---------------------------------------------------------------- brend (Gigant Buxgalter brendbuki)
-# Ranglar logotipdan: ko'mir #2C2B29, to'q sariq #F28322, gradient #ED6A23 → #F39614. Shrift: DM Sans (+ Delius mayda izohlar uchun).
+# Ranglar logotipdan: ko'mir #2C2B29, to'q sariq #F28322, gradient #ED6A23 → #F39614. Shrift: Roboto.
 BRAND_HEAD = ('<link rel="preconnect" href="https://fonts.googleapis.com">'
               '<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>'
-              '<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,400..700'
-              '&family=Delius&display=swap">'
+              '<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&display=swap">'
               '<link rel="icon" href="/brand/logo.png">')
 BRAND_CSS = """
 :root{--ink:#2C2B29;--mut:#857a70;--acc:#F28322;--acc-deep:#ED6A23;--acc-soft:rgba(242,131,34,.12);
@@ -1594,7 +1593,7 @@ BRAND_CSS = """
 --glass:rgba(28,26,30,.62);--edge:rgba(255,255,255,.08);--line:rgba(255,255,255,.07);--shadow:rgba(0,0,0,.45);
 --field:rgba(0,0,0,.25);--dlg:rgba(24,22,26,.97);--solid:#17161a;
 --bg1:#0A0B12;--bg2:#141218;--b1:rgba(237,106,35,.28);--b2:rgba(243,150,20,.16);--b3:rgba(120,90,190,.14)}}
-body{font-family:"DM Sans","Segoe UI",system-ui,sans-serif!important;font-size:14px;letter-spacing:-.005em;
+body{font-family:Roboto,"Segoe UI",system-ui,sans-serif!important;font-size:14px;letter-spacing:0;
 background:radial-gradient(1100px 620px at 0% -10%,var(--b1),transparent 60%),
 radial-gradient(900px 560px at 100% 0%,var(--b2),transparent 58%),
 radial-gradient(900px 600px at 70% 110%,var(--b3),transparent 60%),
@@ -1611,8 +1610,6 @@ box-shadow:0 1px 0 var(--edge) inset,0 18px 50px -24px var(--shadow)!important}
 box-shadow:0 4px 14px -10px var(--shadow)!important;backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px)}
 .btn.ghost:hover{background:#fff!important}
 @media (prefers-color-scheme:dark){.btn.ghost:hover{background:rgba(255,255,255,.1)!important}}
-.btn.red,.btn.stop{background:#d4321c!important;box-shadow:0 8px 22px -10px #d4321c!important}
-.btn.ok{background:#16a34a!important;box-shadow:0 8px 22px -10px #16a34a!important}
 .kpi b{color:var(--ink)!important;font-weight:600!important}
 .kpi:first-child b{background:var(--grad);-webkit-background-clip:text;background-clip:text;color:transparent!important}
 .topbar{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;margin:0 0 26px}
@@ -1627,8 +1624,6 @@ box-shadow:0 4px 14px -10px var(--shadow)!important;backdrop-filter:blur(14px);-
 .navout{color:var(--mut);text-decoration:none;font-weight:500;font-size:13px;padding:8px 14px;border-radius:999px}
 .navout:hover{color:var(--ink);background:var(--glass)}
 @media (max-width:700px){.topbar{gap:10px}.brand img{height:32px}.navpill a{padding:7px 12px;font-size:12.5px}}
-/* --- ikkinchi shrift (qo'lyozma uslubi) — faqat mayda izoh va yorliqlar uchun --- */
-.sub,.mut,.kpi span,.lg,.csum,.dsum,.flash,.foot,p.sub{font-family:Delius,"DM Sans",cursive!important;letter-spacing:0!important}
 /* --- tipografiya: o'qiladigan o'lchamlar, mayda KATTA HARFLI yozuvlarsiz --- */
 body{font-size:15px!important;line-height:1.5}
 .sub,.mut{font-size:13px}
@@ -1647,16 +1642,18 @@ vertical-align:-.2em;margin-right:.4em}
 .btn,.btn.sm,a.btn{display:inline-flex!important;align-items:center;justify-content:center;gap:0}
 .flash{display:flex;align-items:center;gap:4px}.flash .ic{color:var(--acc);width:20px;height:20px}
 .sd{width:8px;height:8px;border-radius:50%;background:currentColor;display:inline-block;flex:none}
-/* --- "liquid glass" tugmalar: shisha yaltirashi, bosilganda siqiladi, holat o'zgarsa silliq o'tadi --- */
-.btn{position:relative;overflow:hidden;isolation:isolate;
-transition:transform .35s cubic-bezier(.2,.9,.3,1.25),box-shadow .3s,background-color .35s,filter .2s!important}
-.btn:before{content:"";position:absolute;inset:0;border-radius:inherit;pointer-events:none;z-index:-1;
-background:linear-gradient(180deg,rgba(255,255,255,.38),rgba(255,255,255,0) 55%)}
-.btn.ghost:before{background:linear-gradient(180deg,rgba(255,255,255,.7),rgba(255,255,255,0) 60%)}
-@media (prefers-color-scheme:dark){.btn.ghost:before{background:linear-gradient(180deg,rgba(255,255,255,.10),transparent 60%)}}
-.btn:hover{transform:translateY(-1px) scale(1.015)!important;filter:saturate(1.08)}
-.btn:active{transform:scale(.95)!important;transition-duration:.12s!important}
-.btn.ghost{box-shadow:inset 0 1px 0 rgba(255,255,255,.9),0 6px 18px -12px var(--shadow)!important}
+/* --- minimalistik tugmalar: tekis rang, ingichka chegara, soyasiz; bosilganda yengil siqiladi --- */
+.btn{position:relative;transition:transform .2s ease,background-color .2s,color .2s,border-color .2s!important;
+font-weight:500!important;border-radius:12px!important;box-shadow:none!important;background:var(--acc)!important}
+.btn:hover{transform:none!important;filter:brightness(.96)}
+.btn:active{transform:scale(.97)!important}
+.btn.ghost{background:transparent!important;color:var(--ink)!important;border:1px solid var(--line)!important;
+box-shadow:none!important;backdrop-filter:none!important;-webkit-backdrop-filter:none!important}
+.btn.ghost:hover{background:var(--glass)!important;border-color:var(--mut)!important;filter:none}
+.btn.red,.btn.stop{background:#d4321c!important}.btn.ok{background:#16a34a!important}
+.ibtn{display:inline-grid;place-items:center;width:34px;height:34px;border-radius:10px;border:1px solid var(--line);
+background:var(--glass);color:var(--ink);cursor:pointer;text-decoration:none;transition:background .2s,border-color .2s}
+.ibtn:hover{border-color:var(--mut);background:var(--solid)}.ibtn .ic{margin:0;width:17px;height:17px}
 .morph{animation:morph .55s cubic-bezier(.2,.9,.3,1.2)}
 @keyframes morph{0%{transform:scale(1);filter:blur(0)}35%{transform:scale(.94,.9);filter:blur(3px)}
 70%{transform:scale(1.02,1.03);filter:blur(0)}100%{transform:scale(1)}}
@@ -2840,13 +2837,14 @@ class Handler(BaseHTTPRequestHandler):
                 log("FRAME ERROR", traceback.format_exc())
                 code, res = 400, {"error": "bad request"}
             return self._out(code, res)
-        if self.path in ("/api/activity", "/api/shot", "/api/wait", "/api/presence"):
+        if self.path in ("/api/activity", "/api/shot", "/api/wait", "/api/presence", "/api/web"):
             # Hodim kompyuteridagi agent (har 30 soniyada + doimiy kutish so'rovi) — logga yozilmaydi
             try:
                 body = json.loads(raw or b"{}")
                 fn = {"/api/activity": lambda: st.api_activity(body, self._ip()), "/api/shot": lambda: st.api_shot(body),
                       "/api/wait": lambda: st.api_wait(body, self._ip()),
-                      "/api/presence": lambda: st.api_presence(body)}[self.path]
+                      "/api/presence": lambda: st.api_presence(body),
+                      "/api/web": lambda: st.api_web(body)}[self.path]
                 code, res = fn()
             except Exception:
                 log("AGENT API ERROR", traceback.format_exc())
@@ -2930,7 +2928,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._out(404, "not found", "text/plain")
             return self._out(200, got[0], got[1], {"Cache-Control": "no-store"})
         if path not in ("/", "/dashboard", "/hisobotlar", "/hisobotlar.csv", "/screentime", "/screentime/shot",
-                        "/screentime/live.json", "/screentime/detail.json", "/screentime/frame"):
+                        "/screentime/live.json", "/screentime/detail.json", "/screentime/frame",
+                        "/screentime/hodim", "/screentime/wb.json", "/screentime/report.json", "/screentime/report.csv"):
             return self._out(404, "not found", "text/plain")
         # Avto-yangilanish (har daqiqa) faollik hisoblanmaydi — faqat foydalanuvchi sahifada nimadir qilgan bo'lsa.
         auto = qs.get("auto", [""])[0] == "1"
@@ -2940,11 +2939,29 @@ class Handler(BaseHTTPRequestHandler):
             return self._go("/login?e=expired" if self._cookie() else "/login")
         if path == "/screentime/live.json":
             return self._out(200, st.live_data(), extra={"Cache-Control": "no-store"})
+        if path in ("/screentime/hodim", "/screentime/wb.json"):
+            u = qs.get("u", [""])[0]
+            day = parse_day(qs.get("d", [""])[0] or "") or now().date().isoformat()
+            if not u.isdigit() or not emp(int(u), active_only=False):
+                return self._out(404, "hodim topilmadi", "text/plain")
+            if path.endswith(".json"):
+                return self._out(200, st.wb_data(int(u), day), extra={"Cache-Control": "no-store"})
+            return self._out(200, st.render_wb(int(u), day), "text/html; charset=utf-8")
+        if path in ("/screentime/report.json", "/screentime/report.csv"):
+            kind = "month" if qs.get("p", [""])[0] == "month" else "week"
+            day = parse_day(qs.get("d", [""])[0] or "") or now().date().isoformat()
+            if path.endswith(".json"):
+                r = st.period_report(kind, day)
+                r.pop("daily", None)
+                return self._out(200, r, extra={"Cache-Control": "no-store"})
+            body, fname = st.report_csv(kind, day, detail=qs.get("t", [""])[0] == "daily")
+            return self._out(200, body, "text/csv; charset=utf-8",
+                             {"Content-Disposition": f'attachment; filename="{fname}"', "Cache-Control": "no-store"})
         if path == "/screentime/frame":
             pid, after = qs.get("id", [""])[0], qs.get("after", ["0"])[0]
             if not pid.isdigit():
                 return self._out(400, "bad id", "text/plain")
-            got = st.frame_get(int(pid), int(after) if after.isdigit() else 0)
+            got = st.frame_get(int(pid), int(after) if after.isdigit() else 0, hq=qs.get("wall", [""])[0] != "1")
             if not got:
                 self.send_response(204)
                 self.send_header("Cache-Control", "no-store")

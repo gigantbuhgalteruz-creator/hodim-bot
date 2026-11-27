@@ -84,6 +84,9 @@ CREATE TABLE IF NOT EXISTS st_rules(k TEXT PRIMARY KEY, cat TEXT, created REAL);
 -- soliq.uz kabinetida qaysi korxona (INN), qaysi sahifada qancha vaqt (hodimlar skriptidan)
 CREATE TABLE IF NOT EXISTS st_company(tg_id INTEGER, day TEXT, inn TEXT, company TEXT, page TEXT,
   secs INTEGER DEFAULT 0, PRIMARY KEY(tg_id, day, inn, page));
+-- Brauzerda har bir sayt (domen) va sahifa uchun aniq vaqt (hodimlar skriptidan, faqat faol tab)
+CREATE TABLE IF NOT EXISTS st_web(tg_id INTEGER, day TEXT, domain TEXT, title TEXT, secs INTEGER DEFAULT 0,
+  PRIMARY KEY(tg_id, day, domain, title));
 """)
         cols = {r[1] for r in db.execute("PRAGMA table_info(st_pcs)")}
         for col, typ in (("blocked", "INTEGER DEFAULT 0"), ("block_msg", "TEXT"), ("block_notify", "INTEGER DEFAULT 0")):
@@ -270,6 +273,337 @@ def _exchange(e, pc_id, body, t_now):
     return cmds, finished
 
 
+# ---------------------------------------------------------------- saytlar bo'yicha aniq vaqt
+LIVE_WEB = {}   # tg_id -> {"ts", "domain", "title", "since"} — hozir qaysi saytda va qachondan beri
+
+
+def api_web(body):
+    """Hodimlar skripti (hamma saytlarda): har 30 soniyada faol tabdagi domen va sahifa nomi."""
+    e = emp_by_key(body.get("key"))
+    if not e:
+        return 401, {"error": "bad key"}
+    domain = re.sub(r"^www\.", "", str(body.get("domain") or "").strip().lower())[:80]
+    if not re.fullmatch(r"[a-z0-9][a-z0-9.-]*\.[a-z0-9-]+", domain or ""):
+        return 200, {"ok": True}
+    title = " ".join(str(body.get("title") or "").split())[:120] or domain
+    try:
+        secs = max(0, min(int(body.get("secs") or 0), 90))
+    except (TypeError, ValueError):
+        secs = 0
+    if not secs:
+        return 200, {"ok": True}
+    q("INSERT INTO st_web(tg_id,day,domain,title,secs) VALUES(?,?,?,?,?) "
+      "ON CONFLICT(tg_id,day,domain,title) DO UPDATE SET secs=secs+excluded.secs",
+      (e["tg_id"], now().date().isoformat(), domain, title, secs))
+    t = time.time()
+    lw = LIVE_WEB.get(e["tg_id"])
+    since = lw["since"] if lw and lw["domain"] == domain and t - lw["ts"] < 75 else t - secs
+    LIVE_WEB[e["tg_id"]] = {"ts": t, "domain": domain, "title": title, "since": since}
+    return 200, {"ok": True}
+
+
+def period_range(kind, day):
+    """'week' — dushanba..yakshanba, 'month' — oyning 1-kuni..oxiri (bugundan keyingi kunlar kirmaydi)."""
+    d = datetime.strptime(day, "%Y-%m-%d").date()
+    if kind == "month":
+        a = d.replace(day=1)
+        b = (a.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1)
+        label = f"{['', 'Yanvar', 'Fevral', 'Mart', 'Aprel', 'May', 'Iyun', 'Iyul', 'Avgust', 'Sentyabr', 'Oktyabr', 'Noyabr', 'Dekabr'][a.month]} {a.year}"
+    else:
+        a = d - timedelta(days=d.weekday())
+        b = a + timedelta(days=6)
+        label = f"{a:%d.%m} – {b:%d.%m.%Y}"
+    return a, min(b, now().date()), label
+
+
+def _hm_avg(vals):
+    if not vals:
+        return ""
+    m = sum(int(v[:2]) * 60 + int(v[3:5]) for v in vals) // len(vals)
+    return f"{m // 60:02d}:{m % 60:02d}"
+
+
+def period_report(kind, day):
+    """Haftalik/oylik statistika: har hodim bo'yicha jami va o'rtacha + kunlik batafsil."""
+    a, b, label = period_range(kind, day)
+    emps = {e["tg_id"]: e["name"] for e in active_employees()}
+    agg = {t: {"name": n, "days": 0, "on": 0, "active": 0, "prod": 0, "unprod": 0, "mine": 0, "other": 0,
+               "starts": [], "ends": []} for t, n in emps.items()}
+    daily = []
+    d = a
+    while d <= b:
+        ds = d.isoformat()
+        for t, s in day_stats(ds).items():
+            if t not in agg or not s.get("on"):
+                continue
+            g = agg[t]
+            cd = company_data(t, ds)
+            mine = sum(r["secs"] for r in cd["rows"] if r["mine"])
+            other = sum(r["secs"] for r in cd["rows"] if not r["mine"])
+            g["days"] += 1
+            for k in ("on", "active", "prod", "unprod"):
+                g[k] += s.get(k, 0)
+            g["mine"] += mine
+            g["other"] += other
+            if s.get("span"):
+                g["starts"].append(s["span"][0])
+                g["ends"].append(s["span"][1])
+            daily.append({"day": ds, "name": g["name"], "on": s.get("on", 0), "active": s.get("active", 0),
+                          "prod": s.get("prod", 0), "unprod": s.get("unprod", 0), "mine": mine, "other": other,
+                          "eff": s.get("eff"), "start": (s.get("span") or ["", ""])[0], "end": (s.get("span") or ["", ""])[1]})
+        d += timedelta(days=1)
+    rows = []
+    for t, g in sorted(agg.items(), key=lambda kv: -kv[1]["active"]):
+        rows.append({"tg": t, "name": g["name"], "days": g["days"], "on": g["on"], "active": g["active"],
+                     "avg": g["active"] // g["days"] if g["days"] else 0, "prod": g["prod"], "unprod": g["unprod"],
+                     "eff": round(100 * g["prod"] / g["active"]) if g["active"] >= 600 else None,
+                     "mine": g["mine"], "other": g["other"], "start": _hm_avg(g["starts"]), "end": _hm_avg(g["ends"])})
+    return {"kind": kind, "label": label, "from": a.isoformat(), "to": b.isoformat(), "rows": rows, "daily": daily}
+
+
+def report_csv(kind, day, detail=False):
+    """Excel ochadigan CSV (UTF-8 BOM, ';'). Vaqtlar soat:daqiqa ko'rinishida."""
+    r = period_report(kind, day)
+
+    def line(vals):
+        out = []
+        for v in vals:
+            v = "" if v is None else str(v)
+            out.append('"' + v.replace('"', '""') + '"' if any(c in v for c in ';"\n') else v)
+        return ";".join(out)
+    if detail:
+        lines = [line(["Sana", "Hodim", "Kompyuterda", "Faol", "Ish dasturlari", "Ish ulushi %", "Chalg'ish",
+                       "O'z korxonalari", "Boshqa korxonalar", "Boshladi", "Tugatdi"])]
+        for x in sorted(r["daily"], key=lambda v: (v["day"], v["name"])):
+            lines.append(line([fmt_day(x["day"]), x["name"], short(x["on"]), short(x["active"]), short(x["prod"]),
+                               x["eff"] if x["eff"] is not None else "", short(x["unprod"]), short(x["mine"]),
+                               short(x["other"]), x["start"], x["end"]]))
+    else:
+        lines = [line([f"Screen time — {r['label']}"]),
+                 line(["Hodim", "Ishlagan kunlar", "Kompyuterda jami", "Faol jami", "Kunlik o'rtacha faol",
+                       "Ish dasturlari", "Ish ulushi %", "Chalg'ish", "O'z korxonalari", "Boshqa korxonalar",
+                       "O'rtacha boshlash", "O'rtacha tugatish"])]
+        for x in r["rows"]:
+            lines.append(line([x["name"], x["days"], short(x["on"]), short(x["active"]), short(x["avg"]), short(x["prod"]),
+                               x["eff"] if x["eff"] is not None else "", short(x["unprod"]), short(x["mine"]),
+                               short(x["other"]), x["start"], x["end"]]))
+    return "﻿" + "\r\n".join(lines) + "\r\n", f"screentime-{kind}-{r['from']}{'-kunlik' if detail else ''}.csv"
+
+
+WB_COL = {"mine": "#F28322", "work": "#22c55e", "neutral": "#60a5fa", "distract": "#ef4444", "idle": "#d6d3d1"}
+WB_NAME = {"mine": "Bizning korxonalar", "work": "Boshqa ish", "neutral": "Boshqa", "distract": "Chalg‘ish",
+           "idle": "Harakatsiz"}
+
+
+def wb_data(tg_id, day):
+    """Hodimning bir kunlik "raqamli muvozanati" (Pixel Digital Wellbeing kabi): umumiy vaqt va toifalar,
+    soatlar bo'yicha, hafta, saytlar (aniq — skriptdan), dasturlar, korxonalar, hozir nima ochiq."""
+    d = datetime.strptime(day, "%Y-%m-%d").date()
+    s = day_stats(day, tg_id).get(tg_id) or {}
+    cd = company_data(tg_id, day)
+    mine = sum(r["secs"] for r in cd["rows"] if r["mine"])
+    other_co = sum(r["secs"] for r in cd["rows"] if not r["mine"])
+    act, prod, unprod, idle = s.get("active", 0), s.get("prod", 0), s.get("unprod", 0), s.get("idle", 0)
+    mine = min(mine, act)
+    work = max(0, prod - mine)
+    neutral = max(0, act - mine - work - unprod)
+    seg = {"mine": mine, "work": work, "neutral": neutral, "distract": unprod, "idle": idle}
+    # Soatlar bo'yicha (agentning daqiqalik yozuvlaridan)
+    hours = {h: {"work": 0, "neutral": 0, "distract": 0, "idle": 0} for h in range(24)}
+    for r in q("SELECT hm, secs, active, cat, app FROM st_minutes WHERE tg_id=? AND day=?", (tg_id, day)):
+        if r["cat"] == "x":
+            continue
+        cat = RULES["app"].get((r["app"] or "").lower(), r["cat"])   # keyin belgilangan tur ham hisobga olinadi
+        k = "idle" if r["active"] < 10 else {"p": "work", "u": "distract"}.get(cat, "neutral")
+        hours[int(r["hm"][:2])][k] += r["secs"]
+    # Hafta: oxirgi 7 kun faol vaqti
+    week = []
+    for i in range(6, -1, -1):
+        dd = (d - timedelta(days=i)).isoformat()
+        ws = day_stats(dd, tg_id).get(tg_id) or {}
+        week.append({"day": dd, "label": ["Du", "Se", "Ch", "Pa", "Ju", "Sh", "Ya"][(d - timedelta(days=i)).weekday()],
+                     "active": ws.get("active", 0), "prod": ws.get("prod", 0), "unprod": ws.get("unprod", 0)})
+    prev = week[-2]["active"] if len(week) > 1 else 0
+    # Saytlar: skriptdan aniq (domen bo'yicha), bo'lmasa — oyna sarlavhalaridan taxminiy
+    sites, exact = {}, False
+    for r in q("SELECT domain, title, secs FROM st_web WHERE tg_id=? AND day=?", (tg_id, day)):
+        exact = True
+        x = sites.setdefault(r["domain"], {"name": r["domain"], "secs": 0, "pages": {}, "cats": {}})
+        x["secs"] += r["secs"]
+        x["pages"][r["title"]] = x["pages"].get(r["title"], 0) + r["secs"]
+        c = classify("web", f"{r['domain']} {r['title']}")
+        x["cats"][c] = x["cats"].get(c, 0) + r["secs"]
+    if not exact:
+        for r in q("SELECT app, title, secs FROM st_usage WHERE tg_id=? AND day=?", (tg_id, day)):
+            if (r["app"] or "").lower() not in BROWSERS:
+                continue
+            name = rule_key(r["app"], r["title"]) or site_of(r["title"])
+            x = sites.setdefault(name, {"name": name, "secs": 0, "pages": {}, "cats": {}})
+            x["secs"] += r["secs"]
+            x["pages"][site_of(r["title"])] = x["pages"].get(site_of(r["title"]), 0) + r["secs"]
+            c = classify(r["app"], r["title"])
+            x["cats"][c] = x["cats"].get(c, 0) + r["secs"]
+    site_list = [{"name": x["name"], "secs": x["secs"], "t": dur(x["secs"]),
+                  "cat": {"p": "work", "u": "distract"}.get(max(x["cats"], key=x["cats"].get), "neutral"),
+                  "pages": [{"name": k[:120], "t": dur(v), "secs": v}
+                            for k, v in sorted(x["pages"].items(), key=lambda kv: -kv[1])[:6]]}
+                 for x in sorted(sites.values(), key=lambda v: -v["secs"])[:40]]
+    apps = [{"name": k, "secs": v[0], "t": dur(v[0]), "cat": {"p": "work", "u": "distract"}.get(v[1], "neutral")}
+            for k, v in top(s.get("apps", {}), 15)]
+    companies = [{"name": r["name"], "inn": r["inn"], "mine": r["mine"], "secs": r["secs"], "t": dur(r["secs"]) if r["secs"] else "—"}
+                 for r in cd["rows"]]
+    # Hozir
+    live, today = None, day == now().date().isoformat()
+    if today:
+        pr = q("SELECT * FROM st_pcs WHERE tg_id=? ORDER BY last_seen DESC LIMIT 1", (tg_id,), one=True)
+        lw = LIVE_WEB.get(tg_id)
+        if pr and pc_online(pr):
+            n = pc_now(pr)
+            live = {"app": app_label(n.get("app")) if n.get("app") else "", "title": site_of(n.get("title", "")),
+                    "idle": n.get("idle", 0), "blocked": bool(n.get("blocked")), "locked": bool(n.get("locked")),
+                    "site": None, "corp": corp_now(tg_id)}
+            if lw and time.time() - lw["ts"] < 75:
+                live["site"] = {"domain": lw["domain"], "title": lw["title"], "secs": int(time.time() - lw["since"])}
+    return {"name": emp_name(tg_id), "day": day, "dayf": fmt_day(day), "today": today, "exact": exact,
+            "total": s.get("on", 0), "active": act, "prev": prev, "span": s.get("span"),
+            "seg": [{"k": k, "name": WB_NAME[k], "col": WB_COL[k], "secs": v, "t": dur(v)} for k, v in seg.items()],
+            "other_co": dur(other_co), "mine_t": dur(mine),
+            "hours": [{"h": h, **hours[h]} for h in range(24)], "week": week,
+            "sites": site_list, "apps": apps, "companies": companies, "live": live}
+
+
+WB_CSS = """
+.wbh{display:flex;align-items:flex-end;justify-content:space-between;gap:14px;flex-wrap:wrap;margin-bottom:6px}
+.wbh .back{color:var(--mut);text-decoration:none;font-size:14px;display:inline-flex;align-items:center;gap:4px}
+.wbh .back:hover{color:var(--acc)}
+.hero{display:grid;grid-template-columns:minmax(240px,320px) 1fr;gap:28px;align-items:center;padding:28px 30px;margin-top:18px}
+.donut{position:relative;width:100%;max-width:290px;aspect-ratio:1;margin:auto}
+.donut svg{width:100%;height:100%;transform:rotate(-90deg)}
+.donut circle{fill:none;stroke-width:26;transition:stroke-dasharray .9s cubic-bezier(.2,.8,.2,1),stroke-dashoffset .9s cubic-bezier(.2,.8,.2,1)}
+.donut .ctr{position:absolute;inset:0;display:grid;place-content:center;text-align:center}
+.donut .ctr b{font-size:34px;font-weight:700;letter-spacing:-.03em;line-height:1.1}
+.donut .ctr span{font-size:13px;color:var(--mut)}
+.delta{display:inline-block;margin-top:6px;padding:3px 10px;border-radius:999px;font-size:12px;font-weight:600;background:var(--line)}
+.delta.up{background:var(--y-bg);color:var(--y)}.delta.down{background:var(--g-bg);color:var(--g)}
+.legend{display:grid;gap:10px}
+.lgr{display:grid;grid-template-columns:14px 1fr auto 52px;gap:12px;align-items:center;font-size:15px}
+.lgr i{width:14px;height:14px;border-radius:5px}
+.lgr b{font-weight:600}.lgr .pc{color:var(--mut);font-size:13px;text-align:right}
+.live{display:flex;align-items:center;gap:14px;padding:16px 22px;margin-top:14px;flex-wrap:wrap}
+.live .pulse{width:12px;height:12px;border-radius:50%;background:#22c55e;box-shadow:0 0 0 0 rgba(34,197,94,.6);animation:pl 1.8s infinite}
+.live.off .pulse{background:#a8a29e;animation:none}
+@keyframes pl{70%{box-shadow:0 0 0 12px rgba(34,197,94,0)}100%{box-shadow:0 0 0 0 rgba(34,197,94,0)}}
+.live .what{font-size:15px;min-width:0;flex:1}.live .what b{font-size:16px}
+.live .ttl{max-width:100%}
+.live .cnt{font-size:28px;font-weight:700;letter-spacing:-.02em;font-variant-numeric:tabular-nums}
+.g2{display:grid;grid-template-columns:3fr 2fr;gap:14px;margin-top:14px}
+.pane{padding:20px 22px}.pane h3{font-size:16px;margin:0 0 14px}
+.chart{width:100%;height:190px;display:block}
+.chart text{font-size:10px;fill:var(--mut);font-family:inherit}
+.chart rect{transition:height .6s,y .6s}
+.pane .tabs2{margin-bottom:12px}
+.rows{display:grid;gap:2px}
+.rw{border-radius:14px;padding:10px 12px;cursor:pointer}.rw:hover,.rw.open{background:var(--acc-soft)}
+.rwh{display:grid;grid-template-columns:38px minmax(0,1fr) auto;gap:12px;align-items:center}
+.av{width:38px;height:38px;border-radius:12px;display:grid;place-items:center;font-weight:700;font-size:16px;color:#fff}
+.rwh .nm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600;font-size:15px}
+.rwh .tm{font-weight:600;font-variant-numeric:tabular-nums;font-size:15px}
+.rw .bar{margin:8px 0 0 50px;height:6px}
+.rw .pg{display:none;margin:8px 0 2px 50px}.rw.open .pg{display:block}
+.pgr{display:flex;justify-content:space-between;gap:12px;font-size:13px;padding:3px 0}.pgr span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.note2{font-size:13px;color:var(--mut);margin:10px 2px 0}
+@media (max-width:820px){.hero{grid-template-columns:1fr}.g2{grid-template-columns:1fr}}
+"""
+
+WB_JS = r"""
+const $=s=>document.querySelector(s),$$=s=>[...document.querySelectorAll(s)];
+const E=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const COL={mine:'#F28322',work:'#22c55e',neutral:'#60a5fa',distract:'#ef4444',idle:'#d6d3d1'};
+const fmt=s=>{s=Math.max(0,Math.round(s||0));const h=Math.floor(s/3600),m=Math.floor(s%3600/60);return h?`${h} soat ${m} daq`:(m?`${m} daq`:`${s} son`)};
+const clock=s=>{s=Math.max(0,Math.floor(s));const h=Math.floor(s/3600),m=Math.floor(s%3600/60),x=s%60;return (h?h+':':'')+String(m).padStart(h?2:1,'0')+':'+String(x).padStart(2,'0')};
+let D=null,TAB='sites',OPEN={},liveBase=0,liveAt=0;
+function donut(){const C=2*Math.PI*90,tot=D.seg.reduce((a,b)=>a+b.secs,0)||1;let off=0;
+ $$('#dn circle.s').forEach((c,i)=>{const v=D.seg[i].secs/tot*C;c.setAttribute('stroke',D.seg[i].col);
+  c.style.strokeDasharray=`${Math.max(0,v-2)} ${C}`;c.style.strokeDashoffset=-off;off+=v});
+ $('#tot').textContent=fmt(D.active);
+ const dl=$('#dl');if(D.prev>300){const p=Math.round((D.active-D.prev)/D.prev*100);dl.hidden=false;
+  dl.className='delta '+(p>0?'up':'down');dl.textContent=(p>0?'+':'')+p+'% kechagiga nisbatan'}else dl.hidden=true;
+ $('#lg').innerHTML=D.seg.map(s=>`<div class="lgr"><i style="background:${s.col}"></i><span>${E(s.name)}</span><b>${s.t}</b>
+  <span class="pc">${Math.round(s.secs/tot*100)}%</span></div>`).join('')+
+  `<div class="note2">O‘z korxonalariga <b>${D.mine_t}</b> · boshqa hodimlarning korxonalariga <b>${D.other_co}</b>`+
+  (D.span?` · ${D.span[0]}–${D.span[1]}`:'')+`</div>`}
+function bars(el,items,keys,labels,maxv,hl){const W=el.clientWidth||600,H=190,b=24,n=items.length,gw=(W-30)/n,bw=Math.min(28,gw*.62);
+ let s=`<line x1="30" y1="${H-b}" x2="${W}" y2="${H-b}" stroke="var(--line)"/>`;
+ [.5,1].forEach(f=>{const y=(H-b)-(H-b-10)*f;s+=`<line x1="30" y1="${y}" x2="${W}" y2="${y}" stroke="var(--line)" stroke-dasharray="3 4"/><text x="0" y="${y+3}">${Math.round(maxv*f/60)}d</text>`});
+ items.forEach((it,i)=>{let y=H-b;const x=30+i*gw+(gw-bw)/2;
+  keys.forEach(k=>{const h=(it[k]||0)/maxv*(H-b-10);if(h>.5){y-=h;s+=`<rect x="${x}" y="${y}" width="${bw}" height="${h}" rx="4" fill="${COL[k]}" opacity="${hl&&!hl(it)?.45:1}"><title>${E(labels(it))}: ${fmt(it[k])}</title></rect>`}});
+  s+=`<text x="${x+bw/2}" y="${H-6}" text-anchor="middle">${E(labels(it))}</text>`});
+ el.innerHTML=s}
+function charts(){const hs=D.hours.filter(h=>h.h>=7&&h.h<=21);
+ bars($('#hc'),hs,['work','neutral','distract','idle'],h=>String(h.h).padStart(2,'0'),3600);
+ const wk=D.week.map(w=>({...w,work:w.prod,distract:w.unprod,neutral:Math.max(0,w.active-w.prod-w.unprod)}));
+ const mx=Math.max(3600,...wk.map(w=>w.active));
+ bars($('#wc'),wk,['work','neutral','distract'],w=>w.label,Math.ceil(mx/3600)*3600,w=>w.day===D.day)}
+function lists(){let rows;
+ if(TAB==='sites')rows=D.sites.map(x=>({k:'s:'+x.name,name:x.name,t:x.t,secs:x.secs,col:COL[x.cat],sub:x.pages}));
+ else if(TAB==='corp')rows=D.companies.map(x=>({k:'c:'+x.inn,name:x.name,t:x.t,secs:x.secs,col:x.mine?COL.mine:COL.neutral,
+  tag:x.mine?'o‘zining':'boshqa hodimniki',sub:[]}));
+ else rows=D.apps.map(x=>({k:'a:'+x.name,name:x.name,t:x.t,secs:x.secs,col:COL[x.cat],sub:[]}));
+ const mx=Math.max(1,...rows.map(r=>r.secs));
+ $('#ls').innerHTML=rows.length?rows.map(r=>`<div class="rw${OPEN[r.k]?' open':''}" data-k="${E(r.k)}"><div class="rwh">
+  <div class="av" style="background:${r.col}">${E((r.name||'?').replace(/^[^\p{L}\p{N}]+/u,'').charAt(0).toUpperCase())}</div>
+  <div class="nm" title="${E(r.name)}">${E(r.name)}${r.tag?` <span class="tg${r.tag==='o‘zining'?' g':' y'}">${r.tag}</span>`:''}</div><div class="tm">${r.t}</div></div>
+  <div class="bar"><i style="width:${r.secs?Math.max(2,Math.round(100*r.secs/mx)):0}%;background:${r.col}"></i></div>
+  ${r.sub&&r.sub.length?`<div class="pg">${r.sub.map(p=>`<div class="pgr"><span>${E(p.name)}</span><b>${p.t}</b></div>`).join('')}</div>`:''}</div>`).join('')
+  :'<div class="note2">Bu kunda ma’lumot yo‘q</div>';
+ $('#exact').textContent=TAB==='sites'?(D.exact?'Aniq: brauzer skriptidan, faqat faol tab hisoblanadi':'Taxminiy: oyna sarlavhalaridan (skript 5.0 o‘rnatilgach aniq bo‘ladi)'):'';
+ $$('#ls .rw').forEach(el=>el.onclick=()=>{OPEN[el.dataset.k]=!OPEN[el.dataset.k];el.classList.toggle('open')})}
+function live(){const L=D.live,el=$('#live');if(!D.today){el.hidden=true;return}el.hidden=false;
+ if(!L){el.classList.add('off');$('#lvw').innerHTML='<b>Kompyuter oflayn</b>';$('#lvc').textContent='';return}
+ el.classList.remove('off');
+ let what=L.blocked?'<b>Kompyuter bloklangan</b>':L.locked?'<b>Ekran qulflangan</b>':
+  L.site?`<b>${E(L.site.domain)}</b><div class="sub ttl">${E(L.site.title)}</div>`:`<b>${E(L.app||'—')}</b><div class="sub ttl">${E(L.title)}</div>`;
+ if(L.corp)what+=`<div class="sub">${E(L.corp.name)} kabinetida · ${E(L.corp.page)}</div>`;
+ if(L.idle>=180&&!L.blocked)what+=`<div class="sub">harakatsiz ${fmt(L.idle)}</div>`;
+ $('#lvw').innerHTML=what;liveBase=L.site?L.site.secs:0;liveAt=Date.now();tick()}
+function tick(){if(D&&D.live&&D.live.site)$('#lvc').textContent=clock(liveBase+(Date.now()-liveAt)/1000);else $('#lvc').textContent=''}
+async function load(){try{const r=await fetch('/screentime/wb.json?auto=1&u='+U+'&d='+DAY,{credentials:'same-origin',cache:'no-store'});
+ D=await r.json();donut();charts();lists();live()}catch(e){}}
+$$('.tabs2 button').forEach(b=>b.onclick=()=>{TAB=b.dataset.t;$$('.tabs2 button').forEach(x=>x.classList.toggle('on',x===b));lists()});
+addEventListener('resize',()=>D&&charts());
+load();setInterval(tick,1000);setInterval(()=>{if(document.visibilityState==='visible'&&D&&D.today)load()},5000);
+"""
+
+
+def render_wb(tg_id, day):
+    """Hodimning "Raqamli muvozanat" sahifasi (Pixel Digital Wellbeing kabi, jonli)."""
+    d = datetime.strptime(day, "%Y-%m-%d").date()
+    today = now().date()
+    prev_d, next_d = (d - timedelta(days=1)).isoformat(), min(d + timedelta(days=1), today).isoformat()
+    C = 2 * 3.14159265 * 90
+    circles = "".join(f'<circle class="s" cx="110" cy="110" r="90" stroke-dasharray="0 {C:.1f}"/>' for _ in range(5))
+    return f"""<!DOCTYPE html><html lang="uz"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>{esc(emp_name(tg_id))} · Raqamli muvozanat</title>{BRAND_HEAD}
+<style>{CSS}{BRAND_CSS}{WB_CSS}</style></head><body><div class="wrap">{brand_nav("screentime")}
+<div class="wbh"><div><a class="back" href="/screentime?d={day}">‹ Screen time</a><h1 style="margin-top:6px">{esc(emp_name(tg_id))}</h1>
+<div class="sub">Raqamli muvozanat — vaqt nimaga sarflanayotgani</div></div>
+<form class="pnav glass" method="get" action="/screentime/hodim"><input type="hidden" name="u" value="{tg_id}">
+<a href="/screentime/hodim?u={tg_id}&d={prev_d}" title="Oldingi kun">‹</a>
+<input type="date" name="d" value="{day}" max="{today.isoformat()}" onchange="this.form.submit()">
+<a href="/screentime/hodim?u={tg_id}&d={next_d}" title="Keyingi kun">›</a></form></div>
+<div class="hero glass"><div class="donut"><svg id="dn" viewBox="0 0 220 220">
+<circle cx="110" cy="110" r="90" stroke="var(--line)"/>{circles}</svg>
+<div class="ctr"><span>Faol vaqt</span><b id="tot">—</b><span class="delta" id="dl" hidden></span></div></div>
+<div class="legend" id="lg"></div></div>
+<div class="live glass" id="live" hidden><span class="pulse"></span><div class="what" id="lvw"></div><div class="cnt" id="lvc"></div></div>
+<div class="g2"><div class="pane glass"><h3>Soatlar bo‘yicha</h3><svg class="chart" id="hc"></svg></div>
+<div class="pane glass"><h3>Oxirgi 7 kun</h3><svg class="chart" id="wc"></svg></div></div>
+<div class="pane glass" style="margin-top:14px"><div class="tabs2"><button class="on" data-t="sites">Saytlar</button>
+<button data-t="corp">Korxonalar</button><button data-t="apps">Dasturlar</button></div>
+<div class="rows" id="ls"></div><div class="note2" id="exact"></div></div>
+</div><script>const U={int(tg_id)},DAY="{day}";{WB_JS}</script></body></html>"""
+
+
 # ---------------------------------------------------------------- korxonalar bo'yicha vaqt
 PRESENCE = {}   # tg_id -> (vaqt, inn, korxona, sahifa) — hozir qaysi kabinetda
 
@@ -395,11 +729,19 @@ def api_frame(headers, raw):
         _SEQ[0] += 1
         FRAMES[r["id"]] = (time.time(), _SEQ[0], raw)   # faqat xotirada, faqat oxirgi kadr; diskka yozilmaydi
         FRAME_COND.notify_all()
-    return 200, {"live": True}
+    hq = LIVE_HQ.get(r["id"], 0) > time.time()
+    # Butun ekranda / boshqaruv oynasida — sifatli va tez; ekranlar devorida — kichik va 2 soniyada bir
+    return 200, {"live": True, "interval": 0.35 if hq else 2.0, "w": 1280 if hq else 640, "q": 55 if hq else 45}
 
 
-def frame_get(pc_id, after):
-    """Dashboard: yangi kadrni kutadi (1.5 s gacha). -> (seq, jpeg) yoki None."""
+LIVE_HQ = {}                      # pc_id -> qachongacha sifatli rejim (butun ekran / boshqaruv oynasi)
+
+
+def frame_get(pc_id, after, hq=True):
+    """Dashboard: yangi kadrni kutadi (1.5 s gacha). -> (seq, jpeg) yoki None.
+    hq=False — ekranlar devori (kichik kadr, 2 soniyada bir)."""
+    if hq:
+        LIVE_HQ[pc_id] = time.time() + 8
     if not live_wanted(pc_id) or live_needs_start(pc_id):
         LIVE[pc_id] = time.time() + 8
         wake(pc_id)
@@ -975,6 +1317,36 @@ tr:last-child td{border-bottom:0}
 .flash{margin-top:20px;padding:12px 18px;font-weight:600}
 .shot{display:block;max-width:100%;border-radius:12px;margin-top:10px;border:1px solid var(--line)}
 details summary{cursor:pointer;color:var(--acc);font-weight:600;font-size:12.5px;margin-top:10px}
+/* --- Ekranlar devori --- */
+.wall{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(300px,100%),1fr));gap:14px}
+.wt-card{padding:8px;border-radius:18px!important}.wt-card.blk{outline:2px solid var(--r)}
+.scr{position:relative;aspect-ratio:16/9;border-radius:12px;overflow:hidden;background:#141218;cursor:zoom-in}
+.scr img{width:100%;height:100%;object-fit:cover;display:block;opacity:0;transition:opacity .4s}
+.wt-card.on .scr img{opacity:1}
+.scr .off{position:absolute;inset:0;display:grid;place-items:center;color:#a8a29e;font-size:13px}
+.wt-card.on .scr .off{display:none}.wt-card.offl .scr{cursor:default}
+.scr .st{position:absolute;left:8px;bottom:8px;display:inline-flex;align-items:center;gap:6px;max-width:calc(100% - 16px);
+padding:3px 9px;border-radius:999px;background:rgba(20,18,24,.72);color:#fff;font-size:11.5px;backdrop-filter:blur(6px)}
+.scr .st em{font-style:normal;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.scr .st.g .sd{color:#4ade80}.scr .st.y .sd{color:#fbbf24}.scr .st.r .sd{color:#f87171}.scr .st .sd{color:#a8a29e}
+.wt{display:flex;align-items:center;gap:8px;padding:10px 4px 2px}
+.wn{flex:1;min-width:0}.wn b{font-size:15px;font-weight:500}.wn .ttl{max-width:100%}
+/* --- Butun ekran --- */
+#fs{position:fixed;inset:0;z-index:100;background:#0b0a0e;display:flex;flex-direction:column}
+#fs[hidden]{display:none}
+.fsbar{display:flex;align-items:center;gap:10px;padding:10px 14px;color:#f4eee8}
+.fsbar b{font-size:16px;font-weight:500}.fsbar .sub{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#a8a29e}
+.fsbar .ibtn{background:rgba(255,255,255,.08);border-color:rgba(255,255,255,.14);color:#f4eee8}
+#fsImg{flex:1;min-height:0;width:100%;object-fit:contain;opacity:0;transition:opacity .3s}#fs.on #fsImg{opacity:1}
+.fswait{position:absolute;inset:60px 0 0;display:grid;place-items:center;color:#a8a29e}#fs.on .fswait{display:none}
+/* --- Statistika --- */
+.stbox{padding:18px 20px}.sthead{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:12px}
+.stexp{margin-left:auto;display:flex;gap:8px}
+.sttab td,.sttab th{padding:11px 12px;white-space:nowrap}.sttab td .ibtn{width:30px;height:30px}
+.tabs2{display:inline-flex;gap:4px;padding:4px;border-radius:12px;background:var(--line)}
+.tabs2 button{font:inherit;font-size:14px;font-weight:500;border:0;background:none;color:var(--mut);padding:6px 16px;border-radius:9px;cursor:pointer;transition:background .2s,color .2s}
+.tabs2 button.on{background:var(--solid);color:var(--ink);box-shadow:0 1px 3px rgba(0,0,0,.08)}
+.mlink{color:inherit;text-decoration:none}.mlink:hover{color:var(--acc)}.mlink span{color:var(--mut);font-weight:400}
 .tiles{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(260px,100%),1fr));gap:12px}
 .tile{font:inherit;color:inherit;text-align:left;cursor:pointer;padding:16px 18px;display:flex;flex-direction:column;gap:6px;
 transition:transform .12s,box-shadow .12s}
@@ -1088,10 +1460,9 @@ def render_page(day, flash=""):
 
     with_pc = {r["tg_id"] for r in allpcs}
     no_agent = [e["name"] for e in active_employees() if e["tg_id"] not in with_pc]
-    pcs_html = (f'<div class="tiles" id="tiles"></div>'
-                f'<div class="acts" style="margin-top:14px">{btn("all", "block", "⛔ Hammasini bloklash", "", "HAMMA onlayn kompyuterlar bloklansinmi?")}'
-                f'{btn("all", "unblock", "🔓 Hammasini ochish")}{btn("all", "shot", "📸 Hammasidan skrinshot")}'
-                f'{btn("all", "shutdown", "⏻ Hammasini o‘chirish", "red", "HAMMA onlayn kompyuterlar o‘chirilsinmi?")}</div>'
+    pcs_html = (f'<div class="wall" id="tiles"></div>'
+                f'<div class="acts" style="margin-top:14px">{btn("all", "block", "⛔ Hammasini bloklash", "ghost", "HAMMA onlayn kompyuterlar bloklansinmi?")}'
+                f'{btn("all", "unblock", "🔓 Hammasini ochish")}</div>'
                 if allpcs else '<div class="glass" style="padding:20px">Hali agent o‘rnatilmagan. '
                                'Telegram botga <b>/agent</b> yozing — o‘rnatish yo‘riqnomasi keladi.</div>')
     if allpcs and no_agent:
@@ -1116,7 +1487,7 @@ def render_page(day, flash=""):
                         f'<i style="display:inline-block;width:8px;height:8px;border-radius:2px;margin-right:6px;'
                         f'background:{CAT_COLOR[v[1]]}"></i>{esc(k)}</div><div class="sub" style="text-align:right">{short(v[0])}</div></div>'
                         for k, v in top(s["sites"], 12))
-        cards.append(f"""<div class="member glass"><div class="mhead"><div><h3>{esc(s['name'])}</h3>
+        cards.append(f"""<div class="member glass"><div class="mhead"><div><h3><a class="mlink" href="/screentime/hodim?u={e['tg_id']}&d={day}">{esc(s['name'])} <span>→</span></a></h3>
 <div class="sub">{f"{s['span'][0]} – {s['span'][1]}" if s['span'] else ''}</div></div>
 <span class="pill {pcls}">{'—' if eff is None else f'Ish: {eff}%'}</span></div>
 <div class="stats"><div><span class="sub">Faol</span><br><b>{short(s['active'])}</b></div>
@@ -1157,7 +1528,8 @@ def render_page(day, flash=""):
               '<span><i style="background:var(--c-i)"></i>Harakatsiz</span><span><i style="background:var(--c-x)"></i>Kompyuter yo‘q / qulflangan</span></div>')
     prev_d, next_d = (d - timedelta(days=1)).isoformat(), min(d + timedelta(days=1), today).isoformat()
     flash_html = f'<div class="flash glass">{iconize(FLASH[flash])}</div>' if flash in FLASH else ""
-    refresh = ('<script>setInterval(function(){if(!document.querySelector("dialog[open]"))'
+    refresh = ('<script>setInterval(function(){if(!document.querySelector("dialog[open]")&&!document.fullscreenElement'
+               '&&document.getElementById("fs").hidden)'
                'location.replace(location.pathname+"?d=' + day + '&auto=1")},120000)</script>') if d == today else ""
     avg_act = short(sum(act) / len(act)) if act else "—"
     return f"""<!DOCTYPE html><html lang="uz"><head><meta charset="utf-8">
@@ -1171,11 +1543,21 @@ def render_page(day, flash=""):
 <div class="kpi glass"><span class="mut">O‘rtacha faol vaqt</span><b>{avg_act}</b></div>
 <div class="kpi glass"><span class="mut">O‘rtacha ish ulushi</span><b>{f"{round(sum(effs) / len(effs))}%" if effs else "—"}</b></div>
 <div class="kpi glass"><span class="mut">Jami chalg‘ish</span><b>{short(unprod)}</b></div></div>
-<h2>Kompyuterlar <span class="sub" style="font-weight:400;margin-left:6px">Hodimni bosing — holati va boshqaruv</span></h2>{pcs_html}
+<h2>Ekranlar <span class="sub" style="font-weight:400;margin-left:6px">jonli · ekranni bosing — butun ekran</span></h2>{pcs_html}
+<h2>Statistika</h2>
+<div class="glass stbox"><div class="sthead"><div class="tabs2" id="stTabs"><button class="on" data-k="week">Hafta</button><button data-k="month">Oy</button></div>
+<div class="pnav glass"><a href="#" id="stPrev" title="Oldingi">‹</a><span id="stLabel" style="padding:0 8px;font-weight:500"></span><a href="#" id="stNext" title="Keyingi">›</a></div>
+<div class="stexp"><a class="btn sm ghost" id="stCsv">{ic("download")}Excel</a><a class="btn sm ghost" id="stCsvD">{ic("download")}Kunlik batafsil</a></div></div>
+<div class="card"><table class="sttab"><thead><tr><th>Hodim</th><th>Kunlar</th><th>Faol jami</th><th>Kunlik o‘rtacha</th>
+<th>Ish ulushi</th><th>Chalg‘ish</th><th>O‘z korxonalari</th><th>Boshqa korxonalar</th><th>Boshlash · tugatish</th><th></th></tr></thead>
+<tbody id="stBody"><tr><td colspan="10" class="sub">Yuklanmoqda…</td></tr></tbody></table></div></div>
 <h2>Korxonalar bo‘yicha vaqt — {d:%d.%m.%Y}</h2>{corp_html}
 <h2>Hodimlar — {d:%d.%m.%Y}</h2>{legend}
 <div class="team" style="margin-top:12px">{''.join(cards) or '<div class="glass" style="padding:20px">Bu kunda ma’lumot yo‘q.</div>'}</div>
 </div>
+<div id="fs" hidden><div class="fsbar"><b id="fsName"></b><span class="sub" id="fsSt"></span>
+<a class="ibtn" id="fsStat" title="Statistika">{ic("chart")}</a><button class="ibtn" id="fsMng" title="Boshqarish">{ic("lock")}</button>
+<button class="ibtn" id="fsX" title="Yopish (Esc)">{ic("xcircle")}</button></div><img id="fsImg" alt="Hodim ekrani"><div class="fswait" id="fsWait">Ekran ulanmoqda…</div></div>
 <dialog id="dPc"><div class="mh"><div><h3 id="mName"></h3><div class="sub" id="mPc"></div></div>
 <button type="button" class="x" data-close aria-label="Yopish">×</button></div>
 <div id="mState" class="state"></div>
@@ -1192,13 +1574,14 @@ def render_page(day, flash=""):
 <div class="lv" id="lv"><img id="lvImg" alt="Hodim ekrani"><span class="lvbadge"><i class="sd"></i>JONLI</span>
 <div class="lvwait" id="lvWait">Ekran ulanmoqda…</div></div>
 <div class="sub mt" id="mSeen"></div>
-<div class="detail"><div class="dh"><b>{ic("clock")}Vaqt nimaga sarflandi</b><span class="sub" id="dDay"></span></div>
+<div class="detail"><div class="dh"><b>{ic("clock")}Vaqt nimaga sarflandi</b><span class="sub" id="dDay"></span>
+<a class="btn sm ghost" id="dFull" style="margin-left:auto">{ic("chart")}To‘liq statistika</a></div>
 <div class="dsum" id="dSum"></div><div id="dTl"></div>{legend}
 <div class="seg"><button type="button" class="on" data-tab="corp">Korxonalar</button><button type="button" data-tab="apps">Dasturlar</button><button type="button" data-tab="sites">Saytlar (brauzer)</button></div>
 <div id="dList" class="dlist"></div>
 <p class="sub">Qatorni bosing — ichida nima ochilgani ko‘rinadi va uni <b>ish</b>, <b>boshqa</b> yoki <b>chalg‘ish</b> deb belgilash mumkin
 (belgi hamma hodimlarga va o‘tgan kunlarga ham qo‘llanadi).</p></div></dialog>
-<script>const CSRF="{CSRF}",DAY="{day}",IC={IC_JS};let DATA={init};{LIVE_JS}</script>{refresh}</body></html>"""
+<script>const CSRF="{CSRF}",DAY="{day}",TODAY="{today.isoformat()}",IC={IC_JS};let DATA={init};{LIVE_JS}</script>{refresh}</body></html>"""
 
 
 def corp_now(tg_id):
@@ -1321,15 +1704,66 @@ LIVE_JS = r"""
 const $=s=>document.querySelector(s),$$=s=>[...document.querySelectorAll(s)];
 const E=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const dlg=$('#dPc');let cur=null,lastShot={},timer=null;
-function tile(p){return `<button type="button" class="tile glass ${p.blocked?'blk':''} ${p.online?'':'off'}" data-id="${p.id}">
-<div class="th"><b>${E(p.name)}</b><span class="pill ${p.cls}"><i class="sd"></i>${E(p.txt)}</span></div>
-<div class="sub">${E(p.pc)}${p.user?' · '+E(p.user):''}</div>
-<div class="now">${p.online?E(p.app||'—'):'<span class="sub">oflayn</span>'}<div class="sub ttl">${E(p.title)}</div>
-${p.corp?'<div class="tcorp'+(p.corp.mine?'':' oth')+'">'+IC.building+'<span>'+E(p.corp.name)+'</span></div>':''}</div>
-<div class="tf"><span>Faol <b>${p.act}</b></span><span>Ish <b>${p.eff==null?'—':p.eff+'%'}</b></span><span class="go">Boshqarish →</span></div></button>`}
-function draw(){const t=$('#tiles');if(t){t.innerHTML=DATA.map(tile).join('');
- $$('.tile').forEach(b=>b.onclick=()=>openPc(+b.dataset.id))}
- if(cur!=null&&dlg.open)fill()}
+// ---- Ekranlar devori: har kompyuter — jonli kichik ekran (2 soniyada bir kadr) ----
+const WALL={};   // id -> {el, seq, run}
+function tileHTML(p){return `<div class="scr" data-act="fs"><img alt=""><div class="off">${p.online?'Ekran ulanmoqda…':'Oflayn'}</div>
+<span class="st ${p.cls}"><i class="sd"></i><em></em></span></div>
+<div class="wt"><div class="wn"><b></b><div class="sub ttl wa"></div></div>
+<a class="ibtn" data-act="stat" title="Statistika">${IC.chart}</a><button type="button" class="ibtn" data-act="mng" title="Boshqarish">${IC.lock}</button></div>`}
+function updTile(w,p){const el=w.el;el.classList.toggle('blk',p.blocked);el.classList.toggle('offl',!p.online);
+ el.querySelector('.wn b').textContent=p.name;el.querySelector('.st').className='st '+p.cls;el.querySelector('.st em').textContent=p.txt;
+ el.querySelector('.wa').textContent=p.online?((p.corp?p.corp.name+' · ':'')+(p.title||p.app||'')):'oflayn';
+ el.querySelector('[data-act=stat]').href='/screentime/hodim?u='+p.tg+'&d='+DAY;
+ if(!p.online){el.querySelector('.off').textContent='Oflayn';el.classList.remove('on')}
+ if(p.online&&!w.run&&DAY===TODAY)wallLoop(p.id)}
+async function wallLoop(id){const w=WALL[id];if(!w||w.run)return;w.run=true;const im=w.el.querySelector('img');
+ while(WALL[id]===w){const p=DATA.find(x=>x.id===id);if(!p||!p.online)break;
+  if(dlg.open||FS.id!=null||document.visibilityState!=='visible'){await sleep(1500);continue}
+  if(p.ver&&!(parseFloat(p.ver)>=1.4)){w.el.querySelector('.off').textContent='Agent yangilanishi kerak';await sleep(8000);continue}
+  try{const r=await fetch('/screentime/frame?auto=1&wall=1&id='+id+'&after='+w.seq,{credentials:'same-origin',cache:'no-store'});
+   if(r.status===200){w.seq=+r.headers.get('X-Seq')||w.seq;const u=URL.createObjectURL(await r.blob());const old=im.src;
+    im.onload=()=>{if(old.startsWith('blob:'))URL.revokeObjectURL(old)};im.src=u;w.el.classList.add('on');await sleep(1200)}
+   else if(r.status!==204)await sleep(3000)}catch(e){await sleep(3000)}}
+ w.run=false}
+function draw(){const t=$('#tiles');if(t){const ids=new Set(DATA.map(p=>p.id));
+  for(const id in WALL)if(!ids.has(+id)){WALL[id].el.remove();delete WALL[id]}
+  DATA.forEach(p=>{let w=WALL[p.id];if(!w){const el=document.createElement('div');el.className='wt-card glass';el.innerHTML=tileHTML(p);
+   el.addEventListener('click',ev=>{const a=ev.target.closest('[data-act]');if(!a)return;
+    if(a.dataset.act==='fs')openFs(p.id);else if(a.dataset.act==='mng'){ev.preventDefault();openPc(p.id)}});
+   t.appendChild(el);w=WALL[p.id]={el,seq:0,run:false}}updTile(w,p)})}
+ if(cur!=null&&dlg.open)fill();if(FS.id!=null)fsInfo()}
+// ---- Butun ekran: bitta hodim ekrani, sifatli va tez ----
+const FS={id:null,run:0};
+function fsInfo(){const p=DATA.find(x=>x.id===FS.id);if(!p)return;$('#fsName').textContent=p.name;
+ $('#fsSt').textContent=p.online?((p.corp?p.corp.name+' · ':'')+(p.title||p.app||'')):'oflayn';$('#fsStat').href='/screentime/hodim?u='+p.tg+'&d='+DAY}
+async function openFs(id){FS.id=id;const run=++FS.run,box=$('#fs'),im=$('#fsImg');box.hidden=false;box.classList.remove('on');fsInfo();
+ try{const pr=box.requestFullscreen&&box.requestFullscreen();if(pr&&pr.catch)pr.catch(()=>{})}catch(e){}
+ let seq=0;while(run===FS.run){try{const r=await fetch('/screentime/frame?auto=1&id='+id+'&after='+seq,{credentials:'same-origin',cache:'no-store'});
+  if(run!==FS.run)break;if(r.status===200){seq=+r.headers.get('X-Seq')||seq;const u=URL.createObjectURL(await r.blob());const old=im.src;
+   im.onload=()=>{if(old.startsWith('blob:'))URL.revokeObjectURL(old)};im.src=u;box.classList.add('on')}else if(r.status!==204)await sleep(2000)}catch(e){await sleep(2000)}}}
+function closeFs(){FS.run++;FS.id=null;$('#fs').hidden=true;if(document.fullscreenElement)document.exitFullscreen().catch(()=>{})}
+$('#fsX').onclick=closeFs;$('#fsMng').onclick=()=>{const id=FS.id;closeFs();openPc(id)};
+document.addEventListener('fullscreenchange',()=>{if(!document.fullscreenElement&&FS.id!=null)closeFs()});
+addEventListener('keydown',e=>{if(e.key==='Escape'&&FS.id!=null)closeFs()});
+// ---- Statistika (hafta / oy) ----
+const ST={k:'week',d:DAY};
+const hm=s=>{s=Math.round(s||0);return Math.floor(s/3600)+':'+String(Math.floor(s%3600/60)).padStart(2,'0')};
+function shiftD(n){const d=new Date(ST.d+'T00:00:00');if(ST.k==='week')d.setDate(d.getDate()+7*n);else d.setMonth(d.getMonth()+n,1);
+ return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0')}
+async function loadSt(){$('#stCsv').href='/screentime/report.csv?p='+ST.k+'&d='+ST.d;$('#stCsvD').href='/screentime/report.csv?p='+ST.k+'&d='+ST.d+'&t=daily';
+ try{const r=await fetch('/screentime/report.json?auto=1&p='+ST.k+'&d='+ST.d,{credentials:'same-origin'});const j=await r.json();
+  $('#stLabel').textContent=j.label;
+  $('#stBody').innerHTML=j.rows.map(x=>`<tr><td><a class="mlink" href="/screentime/hodim?u=${x.tg}&d=${j.to}">${E(x.name)}</a></td>
+  <td>${x.days}</td><td><b>${hm(x.active)}</b></td><td>${hm(x.avg)}</td>
+  <td>${x.eff==null?'—':`<span class="pill ${x.eff>=70?'g':x.eff>=45?'y':'r'}">${x.eff}%</span>`}</td>
+  <td style="color:var(--r)">${hm(x.unprod)}</td><td style="color:var(--g)">${hm(x.mine)}</td><td>${hm(x.other)}</td>
+  <td class="sub">${x.start?x.start+' · '+x.end:'—'}</td>
+  <td><a class="ibtn" href="/screentime/hodim?u=${x.tg}&d=${j.to}" title="Batafsil">${IC.chart}</a></td></tr>`).join('')
+   ||'<tr><td colspan="10" class="sub">Bu davrda ma’lumot yo‘q</td></tr>'}catch(e){$('#stBody').innerHTML='<tr><td colspan="10" class="sub">Yuklab bo‘lmadi</td></tr>'}}
+$$('#stTabs button').forEach(b=>b.onclick=()=>{ST.k=b.dataset.k;$$('#stTabs button').forEach(x=>x.classList.toggle('on',x===b));loadSt()});
+$('#stPrev').onclick=e=>{e.preventDefault();ST.d=shiftD(-1);loadSt()};
+$('#stNext').onclick=e=>{e.preventDefault();const n=shiftD(1);if(n<=TODAY){ST.d=n;loadSt()}};
+loadSt();
 function fill(){const p=DATA.find(x=>x.id===cur);if(!p)return;
  $('#mName').textContent=p.name;$('#mPc').textContent=p.pc+(p.user?' · '+p.user:'')+(p.ver?' · agent '+p.ver:'');
  $('#mState').className='state '+p.cls;$('#mState').innerHTML='<i class="sd"></i>'+E(p.txt);
@@ -1343,7 +1777,8 @@ function fill(){const p=DATA.find(x=>x.id===cur);if(!p)return;
  $('#mSeen').textContent='Oxirgi aloqa: '+p.seen;
  const mc=$('#mCorp');mc.hidden=!p.corp;mc.innerHTML=corpLine(p.corp)}
 $('#mBlock').addEventListener('animationend',e=>e.currentTarget.classList.remove('morph'));
-function openPc(id){cur=id;lastShot={};$('#mBlock').dataset.st='';$('#mToast').hidden=true;$('#mMsg').value='';
+function openPc(id){cur=id;lastShot={};$('#mBlock').dataset.st='';
+ const pp=DATA.find(x=>x.id===id);if(pp)$('#dFull').href='/screentime/hodim?u='+pp.tg+'&d='+DAY;$('#mToast').hidden=true;$('#mMsg').value='';
  $('#dList').innerHTML='<div class="sub">Yuklanmoqda…</div>';$('#dTl').innerHTML='';$('#dSum').innerHTML='';
  fill();dlg.showModal();poll();loadDetail();liveLoop(id)}
 // Jonli ekran: oyna ochiq turganda agent ekranni soniyasiga 2–3 kadr yuboradi (AnyDesk kabi, faqat ko'rish)

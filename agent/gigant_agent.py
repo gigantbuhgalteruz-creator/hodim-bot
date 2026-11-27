@@ -26,7 +26,7 @@ import urllib.error
 import urllib.request
 import zlib
 
-VERSION = "1.6"
+VERSION = "1.7"
 STABLE_URL = "https://gigantbuxgalter.com"   # doimiy server manzili (Cloudflare tunnel, o'zgarmaydi)
 SAMPLE_SEC = 5          # necha soniyada bir tekshiriladi
 FLUSH_SEC = 30          # necha soniyada serverga yuboriladi
@@ -874,11 +874,12 @@ def main():
         from urllib.parse import quote
         log("Jonli ekran boshlandi")
         fails = 0
+        iv, wmax, qual = 0.35, 1280, 55      # server javobiga qarab o'zgaradi (devor — kichik/siyrak, butun ekran — sifatli)
         try:
             while True:
                 t0 = time.time()
                 try:
-                    jpg = screenshot_jpeg(1280, 55)
+                    jpg = screenshot_jpeg(wmax, qual)
                     req = urllib.request.Request(client.base + "/api/frame", data=jpg, method="POST", headers={
                         "Content-Type": "image/jpeg", "X-Key": conf["key"], "X-Pc": quote(pc), "X-User": quote(user),
                         "User-Agent": f"GigantAgent/{VERSION}"})
@@ -887,13 +888,19 @@ def main():
                     fails = 0
                     if not res.get("live"):
                         break
+                    try:
+                        iv = max(0.2, min(float(res.get("interval", iv)), 10.0))
+                        wmax = max(320, min(int(res.get("w", wmax)), 1920))
+                        qual = max(20, min(int(res.get("q", qual)), 90))
+                    except (TypeError, ValueError):
+                        pass
                 except Exception as e:
                     fails += 1
                     if fails >= 5:
                         log("Jonli ekran xatosi:", e)
                         break
                     time.sleep(1)
-                time.sleep(max(0.05, 0.35 - (time.time() - t0)))
+                time.sleep(max(0.05, iv - (time.time() - t0)))
         finally:
             shared["live"] = False
             log("Jonli ekran to'xtadi")
