@@ -17,6 +17,10 @@
 // @noframes
 // ==/UserScript==
 
+// !!! SARLAVHA (@match, @connect, @grant, @run-at) 5.1 dagi holatida MUZLATILGAN.
+// Ularni o'zgartirsangiz, Tampermonkey har bir hodimdan "Обновить" ni qo'lda bosishni so'raydi.
+// Yangilash uchun faqat @version va pastdagi kodni o'zgartiring — shunda hamma kompyuterda jim yangilanadi.
+
 (function () {
   'use strict';
 

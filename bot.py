@@ -145,7 +145,8 @@ for _col, _typ in (("activity", "TEXT"), ("staff", "TEXT"), ("c1", "TEXT"), ("no
                    ("sort", "INTEGER"), ("active", "INTEGER DEFAULT 1")):
     if _col not in {r[1] for r in db.execute("PRAGMA table_info(companies)")}:
         db.execute(f"ALTER TABLE companies ADD COLUMN {_col} {_typ}")
-for _col, _typ in (("role", "TEXT DEFAULT 'hodim'"), ("pw_hash", "TEXT")):      # rollar (hodim / zam / boshliq)
+for _col, _typ in (("role", "TEXT DEFAULT 'hodim'"), ("pw_hash", "TEXT"),      # rollar (hodim / bosh / zam / boshliq)
+                   ("lead", "INTEGER")):                                       # jamoa: qaysi bosh buxgalterga biriktirilgan
     if _col not in {r[1] for r in db.execute("PRAGMA table_info(employees)")}:
         db.execute(f"ALTER TABLE employees ADD COLUMN {_col} {_typ}")
 db.commit()
@@ -190,7 +191,7 @@ def active_employees():
 # ---------------------------------------------------------------- rollar
 # hodim — o'ziga biriktirilgan korxonalar; zam — barcha korxonalar uniki;
 # boshliq — barcha korxonalar uniki + rahbar huquqlari (bot xabarlari, bot buyruqlari, dashboard), davomatdan ozod.
-ROLES = {"hodim": "Hodim", "zam": "ZAM", "boshliq": "Boshliq"}
+ROLES = {"hodim": "Hodim", "bosh": "Bosh buxgalter", "zam": "ZAM", "boshliq": "Boshliq"}
 _ctx = threading.local()      # .admin — hozir buyruq bergan rahbar (javob faqat unga boradi)
 
 
@@ -202,6 +203,47 @@ def role_of(tg_id):
 def sees_all(tg_id):
     """ZAM va Boshliq uchun barcha korxonalar "o'ziniki" hisoblanadi."""
     return role_of(tg_id) in ("zam", "boshliq")
+
+
+# ---------------------------------------------------------------- jamoalar (Bosh buxgalter + biriktirilgan hodimlar)
+def leads():
+    return q("SELECT * FROM employees WHERE active=1 AND role='bosh' ORDER BY name")
+
+
+def team_members(lead_id):
+    """Bosh buxgalterga biriktirilgan hodimlar (o'zi kirmaydi)."""
+    return q("SELECT * FROM employees WHERE active=1 AND lead=? AND tg_id!=? ORDER BY name", (lead_id, lead_id))
+
+
+def team_ids(lead_id):
+    return [lead_id] + [m["tg_id"] for m in team_members(lead_id)]
+
+
+def lead_of(tg_id):
+    """Hodim qaysi bosh buxgalter jamoasida (yo'q bo'lsa None)."""
+    r = q("SELECT e.lead FROM employees e JOIN employees l ON l.tg_id=e.lead "
+          "WHERE e.tg_id=? AND l.active=1 AND l.role='bosh'", (tg_id,), one=True)
+    return r["lead"] if r else None
+
+
+def set_lead(tg_id, lead_id):
+    """Hodimni bosh buxgalter jamoasiga qo'shadi (lead_id=None — jamoadan chiqaradi)."""
+    if not emp(tg_id) or (lead_id is not None and (lead_id == tg_id or role_of(lead_id) != "bosh")):
+        return False
+    q("UPDATE employees SET lead=? WHERE tg_id=?", (lead_id, tg_id))
+    return True
+
+
+def owns(tg_id, inn, day):
+    """Korxona `day` kuni shu hodimniki hisoblanadimi: o'ziga biriktirilgan; ZAM/Boshliq — hammasi;
+    Bosh buxgalter — o'zi va jamoasidagi hodimlarga biriktirilganlari."""
+    resp = responsible(inn, day)
+    if resp == tg_id:
+        return True
+    role = role_of(tg_id)
+    if role in ("zam", "boshliq"):
+        return resp is not None or bool(q(f"SELECT 1 FROM companies WHERE inn=? AND {LISTED}", (inn,), one=True))
+    return role == "bosh" and resp is not None and resp in team_ids(tg_id)
 
 
 def boss_ids():
@@ -252,6 +294,10 @@ def set_role(tg_id, role):
         return False
     old = role_of(tg_id)
     q("UPDATE employees SET role=? WHERE tg_id=?", (role, tg_id))
+    if role == "bosh":                  # bosh buxgalter o'zi boshqa jamoada bo'lmaydi
+        q("UPDATE employees SET lead=NULL WHERE tg_id=?", (tg_id,))
+    elif old == "bosh":                 # bosh buxgalterlikdan olinsa — jamoasi tarqaladi
+        q("UPDATE employees SET lead=NULL WHERE lead=?", (tg_id,))
     # Boshliqqa alohida dashboard login-paroli berilmaydi (rahbar kompyuteridan, umumiy login bilan ishlanadi)
     if old == "boshliq" and role != "boshliq":
         q("UPDATE employees SET pw_hash=NULL WHERE tg_id=?", (tg_id,))
@@ -843,6 +889,122 @@ def matrix_counts(m):
     return tot, by
 
 
+# ---------------------------------------------------------------- jamoa samaradorligi
+# Ball = quyidagilarning tortilgan o'rtachasi (ma'lumoti bor bo'lganlari):
+#   Hisobotlar 40% — mas'ul korxonalarning davr hisobotlaridan topshirilgani (kech topshirilgani yarim ball);
+#   Davomat 20%   — oy boshidan vaqtida kelgan kunlar ulushi;
+#   Korxona ishi 20% — kompyuterdagi faol vaqtning o'z/jamoa korxonalariga sarflangan ulushi (agentdan);
+#   Reyting 20%   — korxonalarning soliq.uz reytingi (ball, 0–100) o'rtachasi.
+PERF_W = {"rep": 40, "att": 20, "work": 20, "rating": 20}
+_PERF = {"t": 0.0, "per": None, "v": None}
+_PERF_LOCK = threading.Lock()
+
+
+def perf_base(per=None, fresh=False):
+    """Barcha hodimlar bo'yicha xom ko'rsatkichlar (5 daqiqa keshlanadi — hisob og'ir)."""
+    per = per or default_period()
+    with _PERF_LOCK:
+        if not fresh and _PERF["v"] and _PERF["per"] == per and time.time() - _PERF["t"] < 300:
+            return _PERF["v"]
+        work, comps = {}, {}
+        for r in period_matrix(per)["rows"]:
+            t = r["resp"]
+            if t is None or not r["c"].get("active", 1):
+                continue
+            comps.setdefault(t, []).append(r["c"])
+            w = work.setdefault(t, {"need": 0, "done": 0, "late": 0, "missing": 0, "error": 0})
+            for cell in r["cells"].values():
+                s = cell["st"]
+                if s not in ("ok", "late", "wait", "error", "missing", "pending"):
+                    continue
+                w["need"] += 1
+                w["done"] += s in ("ok", "late")
+                w["late"] += s == "late"
+                w["missing"] += s in ("missing", "pending")
+                w["error"] += s == "error"
+        d = now().date()
+        att = {s["e"]["tg_id"]: s["eff"] for s in stats(d.replace(day=1), d)}
+        scr = {}
+        try:
+            for r in st.period_report("month", d.isoformat())["rows"]:
+                scr[r["tg"]] = (r["mine"], r["active"])
+        except Exception:
+            log("perf screen", traceback.format_exc())
+        v = {"per": per, "work": work, "comps": comps, "att": att, "scr": scr}
+        _PERF.update(t=time.time(), per=per, v=v)
+        return v
+
+
+def _rating_num(r):
+    m = re.search(r"(\d{1,3})", str(r or ""))
+    return min(100, int(m.group(1))) if m else None
+
+
+def perf_score(ids, base):
+    """Bir hodim yoki jamoa (ids) ko'rsatkichlari va umumiy ball (0–100)."""
+    need = done = late = missing = error = 0
+    cs = []
+    for t in ids:
+        w = base["work"].get(t)
+        if w:
+            need += w["need"]; done += w["done"]; late += w["late"]; missing += w["missing"]; error += w["error"]
+        cs += base["comps"].get(t, [])
+    atts = [base["att"][t] for t in ids if base["att"].get(t) is not None]
+    mine = sum(base["scr"].get(t, (0, 0))[0] for t in ids)
+    active = sum(base["scr"].get(t, (0, 0))[1] for t in ids)
+    rts = [x for x in (_rating_num(c.get("rating")) for c in cs) if x is not None]
+    parts = {
+        "rep": round(100 * (done - late / 2) / need) if need else None,
+        "att": round(sum(atts) / len(atts)) if atts else None,
+        "work": min(100, round(100 * mine / active)) if active >= 3600 else None,
+        "rating": round(sum(rts) / len(rts)) if rts else None,
+    }
+    wsum = sum(PERF_W[k] for k, v in parts.items() if v is not None)
+    score = round(sum(PERF_W[k] * v for k, v in parts.items() if v is not None) / wsum) if wsum else None
+    return {"score": score, "parts": parts, "need": need, "done": done, "late": late, "missing": missing,
+            "error": error, "comps": len(cs), "mine": mine, "active": active, "rated": len(rts)}
+
+
+def teams_data(per=None):
+    """Har bir bosh buxgalter jamoasi: umumiy ball + har a'zo (bosh buxgalterning o'zi birinchi)."""
+    base = perf_base(per)
+    out = []
+    for L in leads():
+        mem = team_members(L["tg_id"])
+        ids = [L["tg_id"]] + [m["tg_id"] for m in mem]
+        rows = [{"e": e, "lead": i == 0, **perf_score([e["tg_id"]], base)} for i, e in enumerate([L] + list(mem))]
+        out.append({"lead": L, "members": mem, "rows": rows, **perf_score(ids, base)})
+    return out, base
+
+
+def _pct(v):
+    return "—" if v is None else f"{v}%"
+
+
+def team_text(t, per):
+    p = t["parts"]
+    lines = [f"👥 <b>{esc(t['lead']['name'])}</b> jamoasi — ball: <b>{_pct(t['score'])}</b>",
+             f"   📄 Hisobotlar ({period_label(per)}): {t['done']}/{t['need']} topshirildi"
+             + (f", {t['missing']} qarz" if t["missing"] else "") + (f", {t['late']} kech" if t["late"] else "")
+             + f" → {_pct(p['rep'])}",
+             f"   ⏰ Davomat: {_pct(p['att'])} · 💻 Korxona ishi: {_pct(p['work'])} · ⭐ Reyting: {_pct(p['rating'])}",
+             f"   🏢 Korxonalar: {t['comps']}"]
+    for r in t["rows"]:
+        lines.append(f"   {'🎖' if r['lead'] else '•'} {esc(r['e']['name'])}: {_pct(r['score'])}"
+                     f" ({r['done']}/{r['need']} hisobot, {r['comps']} korxona)")
+    return "\n".join(lines)
+
+
+def teams_text():
+    teams, base = teams_data()
+    if not teams:
+        return ("Hali Bosh buxgalter yo'q. Dashboard → Hodimlar jadvalida rolni <b>Bosh buxgalter</b> qiling, "
+                "keyin hodimlarni uning jamoasiga biriktiring.")
+    head = (f"👥 <b>Jamoalar samaradorligi</b>\nBall: hisobotlar {PERF_W['rep']}% + davomat {PERF_W['att']}% + "
+            f"korxona ishi {PERF_W['work']}% + reyting {PERF_W['rating']}%\n")
+    return head + "\n\n".join(team_text(t, base["per"]) for t in teams)
+
+
 def debt_text(per=None):
     per = per or default_period()
     m = period_matrix(per)
@@ -1240,6 +1402,7 @@ Pastdagi tugmalar orqali ham ishlatish mumkin (/menu).
 /week — shu hafta
 /month — shu oy
 /forgive TG_ID — oxirgi qoidabuzarlikni bekor qilish
+/jamoa — Bosh buxgalter jamoalari samaradorligi
 /qarz [10.2026] — qaysi korxonaning qaysi hisoboti hali topshirilmagan (standart: o'tgan oy)
 /dashboard — dashboard havolasi
 {st.HELP}
@@ -1252,7 +1415,7 @@ Ish vaqti: {WORK_START}–{WORK_END}, hodim {WORK_START} gacha yumaloq video yub
 MENU = {
     "👥 Hodimlar": ("Hodimlar", [[("➕ Hodim qo'shish", "cmd:/add"), ("🚪 Ishdan bo'shatish", "cmd:/remove")],
                                 [("📋 Ro'yxat", "cmd:/list"), ("💰 Maosh belgilash", "hint:salary")],
-                                [("🙏 Jarimani bekor qilish", "hint:forgive")]]),
+                                [("👥 Jamoalar (Bosh buxgalter)", "cmd:/jamoa"), ("🙏 Jarimani bekor qilish", "hint:forgive")]]),
     "🏢 Korxonalar": ("Korxonalar", [[("➕ Hodimga biriktirish", "cmd:/firma"), ("⇄ Ko'chirish", "cmd:/kochir")],
                                     [("📜 Tarix", "cmd:/tarix"), ("📋 Topshirilmaganlar", "cmd:/qarz")]]),
     "📊 Davomat": ("Davomat va hisobotlar", [[("📅 Bugun", "cmd:/today"), ("🗓 Hafta", "cmd:/week"), ("📆 Oy", "cmd:/month")],
@@ -1277,7 +1440,8 @@ def admin_keyboard(boss=False):
 
 
 def emp_keyboard():
-    return {"keyboard": [EMP_MENU[:2], EMP_MENU[2:]], "resize_keyboard": True, "is_persistent": True}
+    """Oddiy hodim menyusi — statistika va skript kaliti (agent o'rnatish ko'rinmaydi)."""
+    return {"keyboard": [EMP_MENU[:2]], "resize_keyboard": True, "is_persistent": True}
 
 
 def send_menu(chat, text, boss=False):
@@ -1458,6 +1622,9 @@ def handle_owner(text):
             return send(OWNER, "Qoidabuzarlik yo'q.")
         q("DELETE FROM violations WHERE id=?", (v["id"],))
         send(OWNER, f"✅ {v['day']} dagi qoidabuzarlik bekor qilindi.")
+    elif cmd in ("/jamoa", "/jamoalar"):
+        send(OWNER, "⏳ Hisoblanmoqda…" if not _PERF["v"] else "")
+        send(OWNER, teams_text() + f"\n\nBatafsil: {current_url()}/dashboard#jamoalar")
     elif cmd in ("/qarz", "/jadval"):
         per = None
         if args:
@@ -1553,7 +1720,10 @@ def _handle_message(msg, uid, text, admin):
     if "video" in msg:
         return send(uid, "❌ Oddiy video emas — <b>yumaloq video</b> (video xabar) yuboring.")
     if text.startswith("/key"):
-        return send(uid, script_help(e["api_key"]))
+        return tg("sendMessage", chat_id=uid, text=script_help(e["api_key"]), parse_mode="HTML",
+                  disable_web_page_preview=True, reply_markup=(admin_keyboard(True) if admin else emp_keyboard()))
+    if text.startswith("/agent") and not admin:      # agent o'rnatishni rahbar qiladi — hodimga statistika
+        text = "/me"
     if text.startswith("/agent"):
         # Kompyuterga agent o'rnatish yo'riqnomasi (server manzili bor) — 10 daqiqadan keyin chatdan o'chiriladi.
         r = tg("sendMessage", chat_id=uid, text=st.agent_text(temporary=True), parse_mode="HTML",
@@ -1566,8 +1736,22 @@ def _handle_message(msg, uid, text, admin):
         a, b = week_range()
         s = next((x for x in stats(a, b) if x["e"]["tg_id"] == uid), None)
         eff = "—" if not s or s["eff"] is None else f"{s['eff']}%"
+        extra = ""
+        try:    # Bosh buxgalter — o'z jamoasi; jamoa a'zosi — jamoasining umumiy bali
+            lid = uid if e["role"] == "bosh" else lead_of(uid)
+            if lid:
+                base = perf_base()
+                me_ = perf_score([uid], base)
+                extra = (f"📄 Hisobotlarim ({period_label(base['per'])}): {me_['done']}/{me_['need']}"
+                         f" · ball: <b>{_pct(me_['score'])}</b>\n")
+                t = next((x for x in teams_data()[0] if x["lead"]["tg_id"] == lid), None)
+                if t:
+                    extra += (team_text(t, base["per"]) if e["role"] == "bosh" else
+                              f"👥 Jamoa ({esc(t['lead']['name'])}) bali: <b>{_pct(t['score'])}</b>") + "\n"
+        except Exception:
+            log("ME team", traceback.format_exc())
         return tg("sendMessage", chat_id=uid, parse_mode="HTML", reply_markup=(admin_keyboard(True) if admin else emp_keyboard()),
-                  text=f"👷 {esc(e['name'])}\nShu hafta samaradorlik: <b>{eff}</b>\n"
+                  text=f"👷 {esc(e['name'])}\nShu hafta samaradorlik: <b>{eff}</b>\n" + extra
                        + ("" if e["role"] == "boshliq" else f"📹 Har ish kuni {WORK_START} gacha yumaloq video yuboring.\n")
                        + "/key — skript kaliti")
     send(uid, f"📹 Davomat uchun yumaloq video yuboring ({WORK_START} gacha). /me — statistikangiz")
@@ -1642,7 +1826,8 @@ FLASH = {"emp_ok": "✅ Hodim qo'shildi", "emp_nosend": "✅ Hodim qo'shildi, le
          "tr_none": "⚠️ Ko'chirish uchun korxona tanlanmadi", "bad_day": "⚠️ Sana noto'g'ri",
          "fire_ok": "✅ Hodim ishdan bo'shatildi — ismi va tarixi saqlandi", "same": "⚠️ Hodim o'ziga ko'chirilmaydi",
          "stale": "⚠️ Sahifa eskirgan edi — yangilandi. Iltimos, qayta kiriting.",
-         "role_ok": "✅ Rol o'zgartirildi", "role_denied": "⚠️ Rolni faqat rahbar o'zgartira oladi"}
+         "role_ok": "✅ Rol o'zgartirildi", "role_denied": "⚠️ Rolni faqat rahbar o'zgartira oladi",
+         "lead_ok": "✅ Jamoa o'zgartirildi"}
 
 
 # ---- login sessiyalari: har kirish 1 soat amal qiladi, keyin qayta login so'raladi
@@ -1844,7 +2029,17 @@ select.role,span.role{font:inherit;font-size:13px;font-weight:500;padding:5px 10
 background:var(--glass);color:var(--ink);cursor:pointer;width:auto;margin:0;display:inline-block}
 .role.r-zam{background:rgba(96,165,250,.14);border-color:rgba(96,165,250,.4);color:#1d4ed8}
 .role.r-boshliq{background:rgba(242,131,34,.14);border-color:rgba(242,131,34,.45);color:#c2410c}
-.rolef{margin:0}
+.role.r-bosh{background:rgba(34,197,94,.13);border-color:rgba(34,197,94,.42);color:#15803d}
+.rolef{margin:0}.rolef+.rolef{margin-top:6px}
+.teams{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(520px,100%),1fr));gap:14px}
+.tcard{padding:22px 24px}.thead{display:flex;justify-content:space-between;align-items:flex-start;gap:16px}
+.tscore{font-size:40px;font-weight:700;letter-spacing:-.03em;line-height:1}
+.tscore.g{color:#16a34a}.tscore.y{color:#ea580c}.tscore.r{color:#dc2626}
+.tparts{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin:16px 0 6px}
+.tpart{background:var(--acc-soft);border-radius:14px;padding:10px 12px}.tpart b{display:block;font-size:18px}
+.tpart span{font-size:11.5px;color:var(--mut)}
+.tmem{width:100%;margin-top:10px}.tmem td,.tmem th{padding:8px 10px}
+@media (max-width:600px){.tparts{grid-template-columns:repeat(2,1fr)}}
 .ibtn{display:inline-grid;place-items:center;width:34px;height:34px;border-radius:10px;border:1px solid var(--line);
 background:var(--glass);color:var(--ink);cursor:pointer;text-decoration:none;transition:background .2s,border-color .2s}
 .ibtn:hover{border-color:var(--mut);background:var(--solid)}.ibtn .ic{margin:0;width:17px;height:17px}
@@ -1979,7 +2174,65 @@ def role_cell(e, editable):
     return (f'<form method="post" action="/dashboard/role" class="rolef"><input type="hidden" name="csrf" value="{CSRF}">'
             f'<input type="hidden" name="tg_id" value="{e["tg_id"]}"><select name="role" class="role r-{r}" '
             f'onchange="if(this.value!==\'boshliq\'||confirm(\'Boshliq: bot xabarlari va bot buyruqlari unga ham ochiladi, '
-            f'davomatdan ozod bo‘ladi. Davom etamizmi?\'))this.form.submit();else this.value=\'{r}\'">{opts}</select></form>')
+            f'davomatdan ozod bo‘ladi. Davom etamizmi?\'))this.form.submit();else this.value=\'{r}\'">{opts}</select></form>'
+            + team_cell(e, editable))
+
+
+def team_cell(e, editable):
+    """Hodim qaysi Bosh buxgalter jamoasida: rahbar uchun tanlov (oddiy hodim va ZAM uchun)."""
+    if e["role"] in ("bosh", "boshliq"):
+        return ""
+    ls = [L for L in leads() if L["tg_id"] != e["tg_id"]]
+    cur = e["lead"] if any(L["tg_id"] == e["lead"] for L in ls) else None
+    if not ls:
+        return ""
+    if not editable:
+        return f'<div class="sub">Jamoa: {esc(emp_name(cur)) if cur else "—"}</div>'
+    opts = '<option value="">Jamoasiz</option>' + "".join(
+        f'<option value="{L["tg_id"]}"{" selected" if L["tg_id"] == cur else ""}>👥 {esc(L["name"])}</option>' for L in ls)
+    return (f'<form method="post" action="/dashboard/lead" class="rolef"><input type="hidden" name="csrf" value="{CSRF}">'
+            f'<input type="hidden" name="tg_id" value="{e["tg_id"]}"><select name="lead" class="role" title="Jamoa (Bosh buxgalter)" '
+            f'onchange="this.form.submit()">{opts}</select></form>')
+
+
+def teams_html():
+    """Dashboard: "Jamoalar" bo'limi — har Bosh buxgalter jamoasi bali va a'zolar bo'yicha."""
+    try:
+        teams, base = teams_data()
+    except Exception:
+        log("teams_html", traceback.format_exc())
+        return '<div class="member glass mut">Jamoalar hisobida xato — logni tekshiring</div>'
+    if not teams:
+        return ('<div class="member glass mut">Hali Bosh buxgalter yo‘q. Hodimlar jadvalida rolni <b>Bosh buxgalter</b> '
+                'qiling, so‘ng hodimlarni “Jamoa” tanlovi orqali uning jamoasiga biriktiring.</div>')
+
+    def cls(v):
+        return "" if v is None else ("g" if v >= 80 else "y" if v >= 60 else "r")
+    labels = {"rep": f"Hisobotlar · {period_label(base['per'])}", "att": "Davomat · oy",
+              "work": "Korxona ishiga vaqt", "rating": "Korxonalar reytingi"}
+    out = []
+    for t in teams:
+        parts = "".join(f'<div class="tpart"><span>{labels[k]} · {PERF_W[k]}%</span><b>{_pct(v)}</b></div>'
+                        for k, v in t["parts"].items())
+        rows = "".join(
+            f"<tr><td>{'🎖 ' if r['lead'] else ''}<b>{esc(r['e']['name'])}</b>"
+            f"<div class='sub'>{'Bosh buxgalter' if r['lead'] else ROLES.get(r['e']['role'], 'Hodim')}</div></td>"
+            f"<td>{r['comps']}</td><td>{r['done']}/{r['need']}"
+            + (f" <span class='pill r'>{r['missing']} qarz</span>" if r['missing'] else "")
+            + f"</td><td>{_pct(r['parts']['att'])}</td><td>{_pct(r['parts']['work'])}</td><td>{_pct(r['parts']['rating'])}</td>"
+            f"<td><span class='pill {cls(r['score'])}'>{_pct(r['score'])}</span></td></tr>" for r in t["rows"])
+        out.append(f"""<div class="tcard glass"><div class="thead"><div><span class="role r-bosh">Bosh buxgalter</span>
+<h3 style="margin:8px 0 2px;font-size:19px">{esc(t['lead']['name'])} jamoasi</h3>
+<div class="sub">{len(t['members'])} ta hodim · {t['comps']} ta korxona · hisobotlar {t['done']}/{t['need']}"""
+                   + (f", {t['missing']} qarz" if t["missing"] else "") + (f", {t['late']} kech" if t["late"] else "")
+                   + f"""</div></div>
+<div style="text-align:right"><div class="tscore {cls(t['score'])}">{_pct(t['score'])}</div><div class="sub">jamoa bali</div></div></div>
+<div class="tparts">{parts}</div>
+<div style="overflow:auto"><table class="tmem"><tr><th>A'zo</th><th>Korxona</th><th>Hisobot</th><th>Davomat</th>
+<th>Korxona ishi</th><th>Reyting</th><th>Ball</th></tr>{rows}</table></div>
+{'' if t['members'] else '<p class="sub">Jamoaga hali hodim biriktirilmagan — Hodimlar jadvalidagi “Jamoa” tanlovidan foydalaning.</p>'}
+</div>""")
+    return f'<div class="teams">{"".join(out)}</div>'
 
 
 def render_dashboard(flash="", is_owner=True):
@@ -2156,6 +2409,11 @@ padding:10px 13px;border-radius:12px;border:1px solid var(--line);background:var
 <th>Oy samaradorligi</th><th>Oy qoidabuzarlik</th><th>Oy jarima</th><th>Firmalar</th><th>Oy hisobotlari</th></tr>
 {''.join(rows) or '<tr><td colspan=10 class="mut">Hodimlar yo‘q — “+ Hodim qo‘shish” tugmasini bosing</td></tr>'}
 </table></div>
+<h2 id="jamoalar">Jamoalar (Bosh buxgalter)</h2>
+{teams_html()}
+<p class="sub">Jamoa bali = hisobotlar {PERF_W['rep']}% (mas'ul korxonalarning davr hisobotlaridan topshirilgani, kechi — yarim ball)
++ davomat {PERF_W['att']}% + korxona ishiga vaqt {PERF_W['work']}% (kompyuterdagi faol vaqtning o'z/jamoa korxonalariga ulushi)
++ reyting {PERF_W['rating']}% (soliq.uz reytingi o'rtachasi). Ma'lumoti yo'q qismi hisobga olinmaydi. Har 5 daqiqada yangilanadi.</p>
 <h2>Hodimlar va korxonalar</h2>
 <div class="team">{''.join(team) or '<div class="member glass mut">Hodimlar yo‘q</div>'}</div>
 <h2>Oxirgi hisobotlar</h2><div class="card glass"><table><tr><th>Vaqt</th><th>Firma</th><th>Hisobot</th><th>Holat</th>
@@ -2279,7 +2537,12 @@ td.co,th.co{position:sticky;left:0;z-index:1;background:var(--solid);min-width:2
 thead th.co{z-index:3}
 td.co b{font-weight:600;cursor:pointer}td.co b:hover{color:var(--acc)}
 tbody tr:hover td{background:var(--acc-soft)}tbody tr:hover td.co{background:var(--solid)}
-td.n{color:var(--mut);font-size:12px;text-align:right}
+td.n{color:var(--mut);font-size:12px;text-align:right;white-space:nowrap}
+td.n .mv{display:inline-flex;flex-direction:column;gap:2px;vertical-align:middle;margin-right:6px}
+td.n .up{border:0;background:var(--acc-soft);color:var(--acc);border-radius:6px;width:22px;height:16px;padding:0;
+font-size:9px;line-height:16px;cursor:pointer;opacity:.35;transition:opacity .15s,transform .12s}
+tr:hover td.n .up{opacity:1}td.n .up:hover{transform:translateY(-1px);filter:brightness(1.1)}
+tr.moved td{animation:mv .9s}@keyframes mv{from{background:rgba(249,115,22,.22)}}
 .sheet th,.sheet td{border-right:1px solid var(--line)}
 .sheet thead th{white-space:normal;min-width:64px;line-height:1.2;vertical-align:bottom}
 td.ed{cursor:text;min-width:90px;max-width:220px;white-space:normal;font-size:13px}
@@ -2377,6 +2640,13 @@ async function api(data){
  let j=null;try{j=await r.json()}catch(e){}
  if(!j||!j.ok){alert((j&&j.error)||'Saqlanmadi — sessiya tugagan bo‘lishi mumkin. Sahifani yangilang.');throw new Error('save')}
  return j}
+// ▲ — korxona ro'yxatda bir qator tepaga (saqlanadi; qatorlar raqami qayta yoziladi)
+$$('td.n .up').forEach(b=>b.onclick=async e=>{e.stopPropagation();const tr=b.closest('tr'),dn=b.dataset.d==='down',
+ nb=dn?tr.nextElementSibling:tr.previousElementSibling;
+ if(!nb||!nb.dataset.inn)return;b.disabled=true;
+ try{await api({kind:dn?'down':'up',inn:tr.dataset.inn});tr.parentNode.insertBefore(tr,dn?nb.nextSibling:nb);
+  let n=0;tr.parentNode.querySelectorAll('tr[data-inn] .nn').forEach(s=>s.textContent=++n);
+  tr.classList.remove('moved');void tr.offsetWidth;tr.classList.add('moved')}catch(x){}finally{b.disabled=false}});
 // Matnli kataklar: bosing — yozing — Enter (Esc — bekor)
 $$('td.ed').forEach(td=>{
  td.onclick=()=>{if(td.isContentEditable)return;closeMenu();td.dataset.old=td.textContent;td.contentEditable='true';td.focus();
@@ -2559,6 +2829,10 @@ def render_matrix(nav, flash=""):
         f'{" · xato/kech " + str(v["bad"]) if v["bad"] else ""}</div></div>' for s, v in sorted(by.items()) if v["need"])
     head = "".join(f'<th title="{esc(n)}">{esc(x)}</th>' for _k, n, x in TAXES)
     body = []
+    # Tarix (Excel) davrlarida ro'yxat to'liq emas — tartibni faqat joriy davrlarda o'zgartirish mumkin
+    up_btn = "" if is_hist(per) else ('<span class="mv"><button class="up" data-d="up" title="Bir qator tepaga" '
+                                      'aria-label="Tepaga">▲</button><button class="up" data-d="down" '
+                                      'title="Bir qator pastga" aria-label="Pastga">▼</button></span>')
     for i, r in enumerate(m["rows"], 1):
         c = r["c"]
         tds, miss = [], False
@@ -2583,7 +2857,7 @@ def render_matrix(nav, flash=""):
         body.append(
             f'<tr{" class=gone" if gone else ""} data-k="{esc(key)}" data-s="{esc(r["staff"] or "—")}" '
             f'data-m="{1 if miss else 0}" data-inn="{esc(c["inn"])}" data-name="{esc(c["name"] or c["inn"])}">'
-            f'<td class="n">{i}</td><td class="co ed" data-f="name">{esc(c["name"] or "")}</td>'
+            f'<td class="n">{up_btn}<span class="nn">{i}</span></td><td class="co ed" data-f="name">{esc(c["name"] or "")}</td>'
             f'<td class="ed" data-f="activity">{esc(c.get("activity") or "")}</td><td class="ro">{esc(c["inn"])}</td>{rt_td}'
             f'{staff_td}<td class="ed" data-f="c1">{esc(c.get("c1") or "")}</td>{rp_td}{"".join(tds)}'
             f'<td class="ed" data-f="note" style="min-width:160px">{esc(c.get("note") or "")}</td>'
@@ -2751,6 +3025,21 @@ def matrix_api(f):
     if len(inn) not in (9, 14) or not re.match(r"^\d{4}-(0[1-9]|1[0-2])$", per):
         return {"ok": False, "error": "Noto'g'ri so'rov — sahifani yangilang"}
     kind, v = f.get("kind", ""), f.get("v", "")
+    if kind in ("up", "down"):
+        # Ro'yxatda bir qator tepaga/pastga: tartib 1..N qilib yoziladi va qo'shni korxona bilan joy almashadi.
+        with LOCK:
+            order = [r["inn"] for r in db.execute(f"SELECT inn FROM companies WHERE {LISTED} "
+                                                  "ORDER BY sort IS NULL, sort, name").fetchall()]
+            if inn not in order:
+                return {"ok": False, "error": "Korxona ro'yxatda yo'q — sahifani yangilang"}
+            i = order.index(inn)
+            j = i - 1 if kind == "up" else i + 1
+            moved = 0 <= j < len(order)
+            if moved:
+                order[i], order[j] = order[j], order[i]
+            db.executemany("UPDATE companies SET sort=? WHERE inn=?", [(n, x) for n, x in enumerate(order, 1)])
+            db.commit()
+        return {"ok": True, "moved": moved}
     if kind == "staff":
         # Hodim tanlandi: shu davr boshidan (oyning 1-kunidan) korxona unga biriktiriladi, tarix saqlanadi.
         uid = int(v) if v.isdigit() else None
@@ -2994,8 +3283,22 @@ class Handler(BaseHTTPRequestHandler):
             if not uid.isdigit() or not set_role(int(uid), role):
                 return self._redirect("no_emp")
             log("ROLE", uid, role)
+            with _PERF_LOCK:
+                _PERF["t"] = 0.0
             send(OWNER, f"👤 {esc(emp_name(int(uid)))} — rol: <b>{ROLES[role]}</b>", owner_only=True)
             return self._redirect("role_ok")
+        if path == "/dashboard/lead":
+            if SESS_WHO.get(self._cookie(), "owner") != "owner":
+                return self._redirect("role_denied")          # jamoani faqat rahbar o'zgartiradi
+            uid, lid = f.get("tg_id", ""), f.get("lead", "")
+            if not uid.isdigit() or (lid and not lid.isdigit()) or not set_lead(int(uid), int(lid) if lid else None):
+                return self._redirect("no_emp")
+            log("LEAD", uid, lid)
+            with _PERF_LOCK:
+                _PERF["t"] = 0.0                               # jamoa o'zgardi — ballni qayta hisoblaymiz
+            send(OWNER, f"👥 {esc(emp_name(int(uid)))} — " + (f"<b>{esc(emp_name(int(lid)))}</b> jamoasiga qo'shildi"
+                                                               if lid else "jamoadan chiqarildi"), owner_only=True)
+            return self._redirect("lead_ok")
         if path == "/dashboard/add_employee":
             uid, name = f.get("tg_id", "").strip(), " ".join(f.get("name", "").split())[:80]
             if not uid.isdigit():

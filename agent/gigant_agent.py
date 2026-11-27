@@ -3,7 +3,8 @@
 Nima qiladi:
   * har 5 soniyada oldindagi oyna qaysi dasturniki ekanini va hodim klaviatura/sichqonchani
     ishlatayotganini tekshiradi (klaviaturada nima yozilgani O'QILMAYDI);
-  * har 30 soniyada natijani hodim bot serveriga yuboradi (internet bo'lmasa — keyin yuboradi);
+  * brauzerda manzil satridan joriy sayt havolasini o'qiydi (UI Automation);
+  * har 10 soniyada natijani hodim bot serveriga yuboradi (internet bo'lmasa — keyin yuboradi);
   * serverdan buyruq olsa bajaradi: bloklash, o'chirish, qayta yoqish, chiqish, xabar, skrinshot;
   * "kompyuter klub" bloki: butun ekranni yopadigan oyna (rahbar ochmaguncha ishlab bo'lmaydi);
   * buyruqlarni darhol olish uchun serverda doimiy "kutish" so'rovi (long-poll) ushlab turadi.
@@ -26,10 +27,10 @@ import urllib.error
 import urllib.request
 import zlib
 
-VERSION = "1.7"
+VERSION = "1.8"
 STABLE_URL = "https://gigantbuxgalter.com"   # doimiy server manzili (Cloudflare tunnel, o'zgarmaydi)
 SAMPLE_SEC = 5          # necha soniyada bir tekshiriladi
-FLUSH_SEC = 30          # necha soniyada serverga yuboriladi
+FLUSH_SEC = 10          # necha soniyada serverga yuboriladi (jonli jurnal uchun tez)
 IDLE_LIMIT = 180        # shuncha soniya klaviatura/sichqoncha tegilmasa — "harakatsiz"
 MAX_PENDING = 6000      # internet yo'q paytda saqlanadigan yozuvlar chegarasi (~2-3 kun)
 
@@ -151,16 +152,132 @@ def process_name(pid):
 
 
 def foreground():
-    """(dastur.exe, oyna sarlavhasi)."""
+    """(dastur.exe, oyna sarlavhasi, oyna)."""
     hwnd = user32.GetForegroundWindow()
     if not hwnd:
-        return "", ""
+        return "", "", None
     n = user32.GetWindowTextLengthW(hwnd)
     buf = ctypes.create_unicode_buffer(n + 1)
     user32.GetWindowTextW(hwnd, buf, n + 1)
     pid = wt.DWORD()
     user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-    return process_name(pid.value), buf.value
+    return process_name(pid.value), buf.value, hwnd
+
+
+# ---------------------------------------------------------------- brauzer manzili (UI Automation, faqat stdlib)
+BROWSERS = {"chrome.exe", "msedge.exe", "firefox.exe", "opera.exe", "browser.exe", "brave.exe", "vivaldi.exe"}
+
+
+class _VARIANT(ctypes.Structure):
+    _fields_ = [("vt", ctypes.c_ushort), ("r1", ctypes.c_ushort), ("r2", ctypes.c_ushort), ("r3", ctypes.c_ushort),
+                ("val", ctypes.c_void_p), ("val2", ctypes.c_void_p)]
+
+
+def norm_url(v):
+    """Manzil satridagi matn -> 'https://domen/yo'l' (so'rov parametrlari va # olib tashlanadi). URL bo'lmasa ''."""
+    v = (v or "").strip()
+    if not v or " " in v or len(v) > 4000:
+        return ""
+    if not re.match(r"^[a-z][a-z0-9+.-]*://", v, re.I):
+        if not re.match(r"^[\w-]+(\.[\w-]+)+(:\d+)?(/|$)", v):
+            return ""
+        v = "https://" + v
+    m = re.match(r"^(https?://[^/?#\s]+(?:/[^?#\s]*)?)", v, re.I)
+    return m.group(1)[:300] if m else ""
+
+
+class UrlReader:
+    """Oldindagi brauzer oynasining manzil satridan (Chrome, Edge, Firefox, Yandex...) joriy sayt havolasini o'qiydi.
+    Manzil satri elementi har oyna uchun bir marta topiladi va eslab qolinadi — keyingi o'qishlar juda tez."""
+
+    def __init__(self):
+        self.uia = None          # None — hali ochilmagan, False — ishlamaydi
+        self.el = {}             # hwnd -> [element (c_void_p yoki None), oxirgi qidirish vaqti]
+        self.last = {}           # hwnd -> oxirgi to'g'ri URL
+
+    def _open(self):
+        try:
+            ole32.CoInitializeEx(None, 0)                    # MTA
+            clsid = _guid("{ff48dba4-60ef-4201-aa87-54103eef594e}")   # CUIAutomation
+            iid = _guid("{30cbe57d-d9d0-452a-ab13-7ac5ac4825ee}")     # IUIAutomation
+            p = ctypes.c_void_p()
+            hr = ole32.CoCreateInstance(ctypes.byref(clsid), None, 1, ctypes.byref(iid), ctypes.byref(p))
+            self.uia = p if hr == 0 and p.value else False
+        except Exception:
+            log("UIA ochilmadi", traceback.format_exc())
+            self.uia = False
+
+    @staticmethod
+    def _release(p):
+        if p and p.value:
+            try:
+                _com(p, 2, ctypes.c_ulong)(p)
+            except Exception:
+                pass
+
+    def _find(self, hwnd):
+        u = self.uia
+        root, cond, el = ctypes.c_void_p(), ctypes.c_void_p(), ctypes.c_void_p()
+        try:
+            if _com(u, 6, ctypes.c_long, wt.HWND, ctypes.POINTER(ctypes.c_void_p))(u, hwnd, ctypes.byref(root)) != 0 \
+                    or not root.value:
+                return None
+            var = _VARIANT(vt=3, val=50004)                  # VT_I4, UIA_EditControlTypeId
+            if _com(u, 23, ctypes.c_long, ctypes.c_int, _VARIANT, ctypes.POINTER(ctypes.c_void_p))(
+                    u, 30003, var, ctypes.byref(cond)) != 0:  # UIA_ControlTypePropertyId
+                return None
+            _com(root, 5, ctypes.c_long, ctypes.c_int, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p))(
+                root, 4, cond, ctypes.byref(el))             # FindFirst(TreeScope_Descendants) — 1-matn maydoni = manzil satri
+            return el if el.value else None
+        finally:
+            self._release(root)
+            self._release(cond)
+
+    def _prop(self, el, pid):
+        var = _VARIANT()
+        hr = _com(el, 10, ctypes.c_long, ctypes.c_int, ctypes.POINTER(_VARIANT))(el, pid, ctypes.byref(var))
+        if hr != 0:
+            raise OSError(hr)
+        try:
+            if var.vt == 8:                                  # VT_BSTR
+                return ctypes.wstring_at(var.val) if var.val else ""
+            if var.vt == 11:                                 # VT_BOOL
+                return bool(var.val and (var.val & 0xFFFF))
+            return None
+        finally:
+            oleaut32.VariantClear(ctypes.byref(var))
+
+    def read(self, hwnd, app):
+        if not hwnd or (app or "").lower() not in BROWSERS:
+            return ""
+        if self.uia is None:
+            self._open()
+        if not self.uia:
+            return ""
+        key = int(hwnd)
+        rec = self.el.get(key)
+        if rec is None or (rec[0] is None and time.time() - rec[1] > 20):
+            if len(self.el) > 30:                            # yopilgan oynalar to'planib qolmasin
+                for r in self.el.values():
+                    self._release(r[0])
+                self.el.clear()
+                self.last.clear()
+            try:
+                rec = self.el[key] = [self._find(hwnd), time.time()]
+            except Exception:
+                rec = self.el[key] = [None, time.time()]
+        el = rec[0]
+        if el is None:
+            return ""
+        try:
+            if not self._prop(el, 30008):                    # UIA_HasKeyboardFocus: hodim manzil yozayotgan bo'lsa — eski URL
+                u = norm_url(self._prop(el, 30045))          # UIA_ValueValuePropertyId
+                if u:
+                    self.last[key] = u
+        except Exception:
+            self._release(el)                                # oyna yopilgan / element eskirgan — keyingi safar qayta topamiz
+            self.el.pop(key, None)
+        return self.last.get(key, "")
 
 
 def clean_title(t):
@@ -640,6 +757,12 @@ class _EncParams(ctypes.Structure):
 ole32 = ctypes.WinDLL("ole32")
 ole32.CreateStreamOnHGlobal.argtypes = [ctypes.c_void_p, wt.BOOL, ctypes.POINTER(ctypes.c_void_p)]
 ole32.CLSIDFromString.argtypes = [wt.LPCWSTR, ctypes.POINTER(_GUID)]
+ole32.CoInitializeEx.argtypes = [ctypes.c_void_p, wt.DWORD]
+ole32.CoCreateInstance.argtypes = [ctypes.POINTER(_GUID), ctypes.c_void_p, wt.DWORD, ctypes.POINTER(_GUID),
+                                   ctypes.POINTER(ctypes.c_void_p)]
+ole32.CoCreateInstance.restype = ctypes.c_long
+oleaut32 = ctypes.WinDLL("oleaut32")
+oleaut32.VariantClear.argtypes = [ctypes.c_void_p]
 
 
 def _guid(s):
@@ -941,7 +1064,9 @@ def main():
 
     threading.Thread(target=wait_loop, daemon=True).start()
 
-    buckets = {}     # (minute_ts, app, title) -> [secs, active_secs]
+    buckets = {}     # (minute_ts, app, title) -> [secs, active_secs, url]
+    rest = {}        # yaxlitlashda qolgan soniya ulushlari (10 soniyada yuborilganda yo'qolmasin)
+    urls = UrlReader()
     last_flush = 0.0
     last_tick = time.time()
     while True:
@@ -950,26 +1075,40 @@ def main():
             dt = min(max(t - last_tick, 0), SAMPLE_SEC * 3)   # uyqu rejimidan keyin katta oraliq hisoblanmasin
             last_tick = t
             idle = idle_seconds()
+            url = ""
             if screen_locked():
                 app, title, active = "LOCKED", "", False
             elif blocker.on:
                 app, title, active = "BLOCKED", "", False
             else:
-                app, title = foreground()
+                app, title, hwnd = foreground()
                 app, title = (app or "Desktop"), clean_title(title)
                 active = idle < IDLE_LIMIT
-            shared["now"] = {"app": app, "title": title, "idle": int(idle), "locked": app == "LOCKED"}
+                try:
+                    url = urls.read(hwnd, app)
+                except Exception:
+                    log("URL o'qilmadi", traceback.format_exc())
+            shared["now"] = {"app": app, "title": title, "url": url, "idle": int(idle), "locked": app == "LOCKED"}
             if dt > 0:
                 k = (int(t // 60 * 60), app, title)
-                b = buckets.setdefault(k, [0.0, 0.0])
+                b = buckets.setdefault(k, [0.0, 0.0, ""])
                 b[0] += dt
                 if active:
                     b[1] += dt
+                if url:
+                    b[2] = url
 
             if t - last_flush >= FLUSH_SEC:
                 last_flush = t
-                pending += [{"t": k[0], "app": k[1], "title": k[2], "s": round(v[0]), "a": round(v[1])}
-                            for k, v in buckets.items() if round(v[0]) > 0]
+                for k, v in buckets.items():
+                    r = rest.pop(k, [0.0, 0.0])
+                    s_, a_ = v[0] + r[0], v[1] + r[1]
+                    if int(s_) > 0:
+                        pending.append({"t": k[0], "app": k[1], "title": k[2], "s": int(s_), "a": min(int(a_), int(s_)),
+                                        "u": v[2]})
+                    if k[0] >= int(t // 60 * 60):            # joriy daqiqa — qoldiq keyingi yuborishga o'tadi
+                        rest[k] = [s_ - int(s_), a_ - int(min(int(a_), int(s_)))]
+                rest = {k: v for k, v in rest.items() if k[0] >= int(t // 60 * 60)}
                 buckets.clear()
                 pending = pending[-MAX_PENDING:]
                 done = take_done()

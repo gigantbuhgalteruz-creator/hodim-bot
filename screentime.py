@@ -17,7 +17,7 @@ from datetime import datetime, timedelta
 _NAMES = ("q", "db", "LOCK", "send", "send_kb", "tg", "now", "esc", "log", "OWNER", "CFG", "TOKEN", "TZ",
           "emp", "emp_by_key", "emp_name", "active_employees", "is_workday", "at", "WORK_START", "WORK_END",
           "PENDING", "CSRF", "current_url", "parse_day", "once", "BASE", "DISC_URL", "DISC_SECRET",
-          "BRAND_HEAD", "BRAND_CSS", "brand_nav", "ic", "iconize", "IC_JS", "responsible", "sees_all", "role_of", "ROLES")
+          "BRAND_HEAD", "BRAND_CSS", "brand_nav", "ic", "iconize", "IC_JS", "responsible", "sees_all", "role_of", "ROLES", "team_ids")
 
 ONLINE_SEC = 120          # shuncha soniya signal bo'lmasa — oflayn
 CMD_TTL = 600             # oflayn kompyuterga buyruq 10 daqiqa kutadi, keyin bekor bo'ladi
@@ -94,6 +94,8 @@ CREATE TABLE IF NOT EXISTS st_weblog(tg_id INTEGER, day TEXT, hm TEXT, domain TE
 CREATE TABLE IF NOT EXISTS st_web(tg_id INTEGER, day TEXT, domain TEXT, title TEXT, secs INTEGER DEFAULT 0,
   PRIMARY KEY(tg_id, day, domain, title));
 """)
+        if "url" not in {r[1] for r in db.execute("PRAGMA table_info(st_log)")}:
+            db.execute("ALTER TABLE st_log ADD COLUMN url TEXT")    # agent 1.8+: brauzer manzil satridan havola
         cols = {r[1] for r in db.execute("PRAGMA table_info(st_pcs)")}
         for col, typ in (("blocked", "INTEGER DEFAULT 0"), ("block_msg", "TEXT"), ("block_notify", "INTEGER DEFAULT 0")):
             if col not in cols:
@@ -181,6 +183,17 @@ def short(s):
     return f"{s // 3600}:{(s % 3600) // 60:02d}"
 
 
+def clean_url(u):
+    """Faqat sxema+domen+yo'l (so'rov parametrlari va # — olib tashlanadi: tokenlar/shaxsiy ma'lumot bo'lishi mumkin)."""
+    m = re.match(r"^(https?://[^/?#\s]+(?:/[^?#\s]*)?)", str(u or "").strip(), re.I)
+    return m.group(1)[:300] if m else ""
+
+
+def url_domain(u):
+    m = re.match(r"^https?://(?:[^@/]*@)?([^/:?#]+)", u or "", re.I)
+    return re.sub(r"^www\.", "", m.group(1).lower()) if m else ""
+
+
 def pc_online(r):
     return r["last_seen"] and time.time() - r["last_seen"] < ONLINE_SEC
 
@@ -209,6 +222,8 @@ def pc_state(r):
         return "🔒", "ekran qulflangan"
     if n.get("idle", 0) >= 180:
         return "🟡", f"harakatsiz {dur(n.get('idle'))}"
+    if n.get("url") and url_domain(n["url"]):
+        return "🟢", f"{app_label(n['app'])} · {url_domain(n['url'])}"
     return "🟢", app_label(n["app"]) if n.get("app") else "onlayn"
 
 
@@ -228,7 +243,7 @@ def _cur(body):
         idle = int(cur.get("idle") or 0)
     except (TypeError, ValueError):
         idle = 0
-    out = {"app": str(cur.get("app", ""))[:80], "title": str(cur.get("title", ""))[:150],
+    out = {"app": str(cur.get("app", ""))[:80], "title": str(cur.get("title", ""))[:150], "url": clean_url(cur.get("url")),
            "idle": idle, "locked": bool(cur.get("locked")), "blocked": bool(cur.get("blocked"))}
     for k in ("boot", "astart"):        # Windows yoqilgan vaqt va agent ishga tushgan vaqt (yopib qo'yishni aniqlash)
         try:
@@ -240,6 +255,7 @@ def _cur(body):
 
 
 TAMPER_SENT = {}   # pc_id -> oxirgi ogohlantirish vaqti
+LIVE_URL = {}      # tg_id -> {"ts", "domain", "since"} — agent manzil satridan
 
 
 def _touch_pc(e, body, ip, cur, t_now):
@@ -252,6 +268,13 @@ def _touch_pc(e, body, ip, cur, t_now):
                "now=excluded.now, ver=excluded.ver, ip=excluded.ip",
                (pc, user, e["tg_id"], t_now, json.dumps(cur, ensure_ascii=False),
                 str(body.get("ver") or "")[:20], ip, t_now))
+    d = url_domain(cur.get("url"))                    # hozir qaysi saytda va qachondan beri (agent 1.8+)
+    lu = LIVE_URL.get(e["tg_id"])
+    if d:
+        since = lu["since"] if lu and lu["domain"] == d and t_now - lu["ts"] < 75 else t_now
+        LIVE_URL[e["tg_id"]] = {"ts": t_now, "domain": d, "since": since}
+    elif lu:
+        LIVE_URL.pop(e["tg_id"], None)
     pc_id = old["id"] if old else db.execute("SELECT id FROM st_pcs WHERE pc=? AND winuser=?",
                                              (pc, user)).fetchone()["id"]
     try:
@@ -477,6 +500,26 @@ def report_emp_csv(kind, day, tg_id):
     return "﻿" + "\r\n".join(L) + "\r\n", f"samaradorlik-{safe}-{kind}-{a.isoformat()}.csv"
 
 
+def mine_checker(tg_id, day):
+    """inn -> korxona shu hodimniki hisoblanadimi (`day` kuni). Hodim — o'ziga biriktirilgan;
+    Bosh buxgalter — o'zi va jamoasidagi hodimlarga biriktirilgan; ZAM/Boshliq — ro'yxatdagi hammasi."""
+    role = role_of(tg_id)
+    team = set(team_ids(tg_id)) if role == "bosh" else {tg_id}
+    listed = {r["inn"] for r in q("SELECT inn FROM companies WHERE COALESCE(active,1)=1")} \
+        if role in ("zam", "boshliq") else set()
+    cache = {}
+
+    def assigned(inn):
+        if inn not in cache:
+            cache[inn] = responsible(inn, day) in team
+        return cache[inn]
+
+    def is_mine(inn):
+        return inn in listed or assigned(inn)
+    is_mine.assigned = assigned
+    return is_mine
+
+
 def company_matcher():
     """Ro'yxatdagi korxonalar + oyna/sahifa nomidan korxonani topuvchi funksiya."""
     comps = {r["inn"]: r["name"] or r["inn"] for r in q("SELECT inn, name FROM companies WHERE COALESCE(active,1)=1")}
@@ -503,9 +546,9 @@ def activity_log(tg_id, day):
     """Faoliyat jurnali: kun davomida "nechadan nechagacha — qaysi dastur/sayt — qaysi korxona" bo'laklari.
     Agentning daqiqalik yozuvi + brauzer skripti (sahifa, havola) + soliq kabineti (INN) birlashtiriladi."""
     comps, match = company_matcher()
-    allmine = sees_all(tg_id)
+    is_mine = mine_checker(tg_id, day)
     mins, act = {}, {}
-    for r in q("SELECT hm, app, title, secs, active FROM st_log WHERE tg_id=? AND day=?", (tg_id, day)):
+    for r in q("SELECT hm, app, title, secs, active, url FROM st_log WHERE tg_id=? AND day=?", (tg_id, day)):
         act[r["hm"]] = act.get(r["hm"], 0) + r["active"]
         m = mins.get(r["hm"])
         if not m or r["secs"] > m["secs"]:
@@ -521,17 +564,23 @@ def activity_log(tg_id, day):
         m = mins[hm]
         app = m["app"] or "?"
         if app.upper() in ("LOCKED", "BLOCKED"):
-            rows.append({"hm": hm, "label": app_label(app), "sub": "", "url": "", "inn": None, "cat": "x"})
+            rows.append({"hm": hm, "label": app_label(app), "sub": "", "url": "", "inn": None, "cat": "x", "via": ""})
             continue
-        w = web.get(hm) or web.get(_hm_add(hm, 1)) if app.lower() in BROWSERS else None
-        if w:
+        browser = app.lower() in BROWSERS
+        w = web.get(hm) or web.get(_hm_add(hm, 1)) if browser else None
+        mu = (m.get("url") or "") if browser else ""          # agent 1.8+: manzil satridan aniq havola
+        if mu and url_domain(mu):
+            label, sub, url = url_domain(mu), site_of(m["title"]), mu
+        elif w:
             label, sub, url = w["domain"], w["title"], w["url"] or ""
         else:
-            label, sub, url = app_label(app), (site_of(m["title"]) if app.lower() in BROWSERS else m["title"]), ""
-        inn = kab.get(hm) or kab.get(_hm_add(hm, 1)) if (w and "soliq.uz" in w["domain"]) else None
+            label, sub, url = app_label(app), (site_of(m["title"]) if browser else m["title"]), ""
+        site = browser and label != app_label(app)
+        inn = kab.get(hm) or kab.get(_hm_add(hm, 1)) if (site and "soliq.uz" in label) else None
         inn = inn or match(m["title"]) or (match(w["title"]) if w else None)
-        cat = "i" if act.get(hm, 0) < 10 else classify(app, f"{label} {sub}" if w else m["title"])
-        rows.append({"hm": hm, "label": label, "sub": sub or "", "url": url, "inn": inn, "cat": cat})
+        cat = "i" if act.get(hm, 0) < 10 else classify(app, f"{label} {sub}" if site else m["title"])
+        rows.append({"hm": hm, "label": label, "sub": sub or "", "url": url, "inn": inn, "cat": cat,
+                     "via": app_label(app) if site else ""})
     # Ketma-ket daqiqalarni bo'laklarga birlashtirish (2 daqiqagacha uzilish — bitta bo'lak)
     segs = []
     for r in rows:
@@ -541,17 +590,17 @@ def activity_log(tg_id, day):
             s["last"] = r["hm"]
             s["mins"] += 1
             s["subs"][r["sub"]] = s["subs"].get(r["sub"], 0) + 1
-            if r["url"] and r["url"] not in s["urls"] and len(s["urls"]) < 5:
+            if r["url"] and r["url"] not in s["urls"] and len(s["urls"]) < 8:
                 s["urls"].append(r["url"])
         else:
             segs.append({"from": r["hm"], "last": r["hm"], "mins": 1, "label": r["label"], "inn": r["inn"],
-                         "cat": r["cat"], "subs": {r["sub"]: 1}, "urls": [r["url"]] if r["url"] else []})
+                         "cat": r["cat"], "subs": {r["sub"]: 1}, "urls": [r["url"]] if r["url"] else [], "via": r["via"]})
     out, per_co = [], {}
     for s in segs:
         subs = [k for k, _v in sorted(s["subs"].items(), key=lambda kv: -kv[1]) if k][:3]
-        mine = bool(s["inn"]) and (allmine and s["inn"] in comps or responsible(s["inn"], day) == tg_id)
+        mine = bool(s["inn"]) and is_mine(s["inn"])
         out.append({"from": s["from"], "to": _hm_add(s["last"]), "mins": s["mins"], "t": dur(s["mins"] * 60),
-                    "label": s["label"], "subs": subs, "urls": s["urls"],
+                    "label": s["label"], "subs": subs, "urls": s["urls"], "via": s["via"],
                     "company": comps.get(s["inn"], s["inn"]) if s["inn"] else "", "mine": mine,
                     "cat": {"p": "work", "u": "distract", "i": "idle", "x": "idle"}.get(s["cat"], "neutral")})
         if s["inn"] and s["cat"] != "i":
@@ -662,7 +711,11 @@ def wb_data(tg_id, day):
             live = {"app": app_label(n.get("app")) if n.get("app") else "", "title": site_of(n.get("title", "")),
                     "idle": n.get("idle", 0), "blocked": bool(n.get("blocked")), "locked": bool(n.get("locked")),
                     "site": None, "corp": corp_now(tg_id)}
-            if lw and time.time() - lw["ts"] < 75:
+            lu = LIVE_URL.get(tg_id)
+            if n.get("url") and lu and lu["domain"] == url_domain(n["url"]):
+                live["site"] = {"domain": lu["domain"], "title": site_of(n.get("title", "")), "url": n["url"],
+                                "via": app_label(n.get("app")), "secs": int(time.time() - lu["since"])}
+            elif lw and time.time() - lw["ts"] < 75:
                 live["site"] = {"domain": lw["domain"], "title": lw["title"], "secs": int(time.time() - lw["since"])}
     co_time = {c["inn"]: c for c in lg["companies"]}
     have = {c["inn"] for c in companies}
@@ -737,6 +790,7 @@ WB_CSS = """
 .lgu{display:flex;flex-direction:column;gap:2px;margin-top:4px}
 .lgu a{font-size:12.5px;color:var(--acc);text-decoration:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .lgu a:hover{text-decoration:underline}
+.via{font-size:12px;color:var(--mut);font-weight:400}.fav{font-size:13px;line-height:1}
 .tg{display:inline-block;padding:2px 9px;border-radius:999px;font-size:11.5px;font-weight:500;background:var(--line);color:var(--mut)}
 .tg.g{background:rgba(242,131,34,.14);color:#c2410c}.tg.y{background:var(--line);color:var(--mut)}
 @media (max-width:820px){.hero{grid-template-columns:1fr}.g2{grid-template-columns:1fr}}
@@ -763,7 +817,8 @@ function logList(){if(!D.log.length)return '<div class="note2">Bu kunda faoliyat
  return D.log.slice().reverse().map(s=>{const k='l:'+s.from;
   const links=s.urls.map(u=>`<a href="${E(u)}" target="_blank" rel="noopener noreferrer">${E(u.replace(/^https?:\/\//,'').slice(0,80))}</a>`).join('');
   return `<div class="lg-row${OPEN[k]?' open':''}" data-k="${E(k)}"><div class="lgt"><b>${s.from}–${s.to}</b><span>${s.t}</span></div>
-  <i class="lgc" style="background:${COL[s.cat]}"></i><div class="lgm"><div class="lgl"><b>${E(s.label)}</b>
+  <i class="lgc" style="background:${COL[s.cat]}"></i><div class="lgm"><div class="lgl">${s.via?'<span class="fav">🌐</span>':''}<b>${E(s.label)}</b>
+  ${s.via?`<span class="via">${E(s.via)}</span>`:''}
   ${s.company?`<span class="tg ${s.mine?'g':'y'}">${E(s.company)}</span>`:''}</div>
   <div class="sub ttl">${E(s.subs.join(' · '))}</div>${links?`<div class="lgu">${links}</div>`:''}</div></div>`}).join('')}
 function bars(el,items,keys,labels,maxv,hl){const W=el.clientWidth||600,H=190,b=24,n=items.length,gw=(W-30)/n,bw=Math.min(28,gw*.62);
@@ -797,7 +852,8 @@ function live(){const L=D.live,el=$('#live');if(!D.today){el.hidden=true;return}
  if(!L){el.classList.add('off');$('#lvw').innerHTML='<b>Kompyuter oflayn</b>';$('#lvc').textContent='';return}
  el.classList.remove('off');
  let what=L.blocked?'<b>Kompyuter bloklangan</b>':L.locked?'<b>Ekran qulflangan</b>':
-  L.site?`<b>${E(L.site.domain)}</b><div class="sub ttl">${E(L.site.title)}</div>`:`<b>${E(L.app||'—')}</b><div class="sub ttl">${E(L.title)}</div>`;
+  L.site?`<b>${E(L.site.domain)}</b>${L.site.via?` <span class="via">${E(L.site.via)}</span>`:''}<div class="sub ttl">${E(L.site.title)}</div>`+
+   (L.site.url?`<div class="lgu"><a href="${E(L.site.url)}" target="_blank" rel="noopener noreferrer">${E(L.site.url.replace(/^https?:\/\//,'').slice(0,90))}</a></div>`:''):`<b>${E(L.app||'—')}</b><div class="sub ttl">${E(L.title)}</div>`;
  if(L.corp)what+=`<div class="sub">${E(L.corp.name)} kabinetida · ${E(L.corp.page)}</div>`;
  if(L.idle>=180&&!L.blocked)what+=`<div class="sub">harakatsiz ${fmt(L.idle)}</div>`;
  $('#lvw').innerHTML=what;liveBase=L.site?L.site.secs:0;liveAt=Date.now();tick()}
@@ -891,11 +947,11 @@ def company_data(tg_id, day):
     2) boshqa dasturlar (1C, Excel, Word, Telegram, brauzer) — oyna sarlavhasida korxona nomi yoki INN bo'lsa."""
     comps = {r["inn"]: r["name"] or r["inn"] for r in q("SELECT inn, name FROM companies WHERE COALESCE(active,1)=1")}
     out = {}
-    allmine = sees_all(tg_id)          # ZAM / Boshliq — ro'yxatdagi barcha korxonalar uniki
+    is_mine = mine_checker(tg_id, day)  # o'ziniki / jamoasiniki (Bosh buxgalter) / hammasi (ZAM, Boshliq)
 
     def slot(inn, name=""):
         return out.setdefault(inn, {"inn": inn, "name": comps.get(inn) or name or inn, "listed": inn in comps,
-                                    "mine": (allmine and inn in comps) or responsible(inn, day) == tg_id,
+                                    "mine": is_mine(inn),
                                     "secs": 0, "parts": {}})
 
     for r in q("SELECT inn, company, page, secs FROM st_company WHERE tg_id=? AND day=?", (tg_id, day)):
@@ -920,7 +976,7 @@ def company_data(tg_id, day):
         k = (app_label(r["app"]), label[:120])
         s["parts"][k] = s["parts"].get(k, 0) + r["secs"]
     for inn, name in comps.items():                 # biriktirilgan, lekin bugun ochilmagan korxonalar ham ko'rinsin
-        if inn not in out and responsible(inn, day) == tg_id:
+        if inn not in out and is_mine.assigned(inn):
             slot(inn)
     rows = []
     for s in sorted(out.values(), key=lambda v: (-v["secs"], v["name"])):
@@ -934,7 +990,7 @@ def company_data(tg_id, day):
     now_c = None
     if pr and time.time() - pr[0] < 75:
         now_c = {"inn": pr[1], "name": comps.get(pr[1]) or pr[2] or pr[1], "page": pr[3],
-                 "mine": (allmine and pr[1] in comps) or responsible(pr[1], day) == tg_id}
+                 "mine": is_mine(pr[1])}
     return {"rows": rows, "mine": short(mine), "other": short(other), "now": now_c}
 
 
@@ -1083,7 +1139,7 @@ def api_activity(body, ip):
     pc = str(body.get("pc") or "PC")[:60]
     cur = _cur(body)
     t_now = time.time()
-    usage, minutes = [], []
+    usage, minutes, urls = [], [], []
     for it in (body.get("items") or [])[:2000]:
         try:
             ts = int(it["t"])
@@ -1099,13 +1155,14 @@ def api_activity(body, ip):
         day, hm = dt.date().isoformat(), dt.strftime("%H:%M")
         usage.append((e["tg_id"], day, app, title, s, a))
         minutes.append((e["tg_id"], day, hm, s, a, app, classify(app, title), s))
+        urls.append(clean_url(it.get("u")))
     with LOCK:
         pc_id, prev = _touch_pc(e, body, ip, cur, t_now)
         # Faoliyat jurnali: har daqiqa qaysi dastur/oyna (soat nechadan nechagacha ishlaganini ko'rsatish uchun)
-        db.executemany("INSERT INTO st_log(tg_id,day,hm,app,title,secs,active) VALUES(?,?,?,?,?,?,?) "
+        db.executemany("INSERT INTO st_log(tg_id,day,hm,app,title,secs,active,url) VALUES(?,?,?,?,?,?,?,?) "
                        "ON CONFLICT(tg_id,day,hm,app,title) DO UPDATE SET secs=secs+excluded.secs, "
-                       "active=active+excluded.active", [(u[0], u[1], m[2], u[2], u[3], u[4], u[5])
-                                                         for u, m in zip(usage, minutes)])
+                       "active=active+excluded.active, url=COALESCE(NULLIF(excluded.url,''),url)",
+                       [(u[0], u[1], m[2], u[2], u[3], u[4], u[5], url) for u, m, url in zip(usage, minutes, urls)])
         db.executemany("INSERT INTO st_usage(tg_id,day,app,title,secs,active) VALUES(?,?,?,?,?,?) "
                        "ON CONFLICT(tg_id,day,app,title) DO UPDATE SET secs=secs+excluded.secs, "
                        "active=active+excluded.active", usage)
@@ -1843,7 +1900,7 @@ def corp_now(tg_id):
         return None
     c = q("SELECT name FROM companies WHERE inn=?", (pr[1],), one=True)
     return {"name": (c and c["name"]) or pr[2] or pr[1], "page": pr[3],
-            "mine": bool(c and sees_all(tg_id)) or responsible(pr[1], now().date().isoformat()) == tg_id}
+            "mine": mine_checker(tg_id, now().date().isoformat())(pr[1])}
 
 
 def live_data():
