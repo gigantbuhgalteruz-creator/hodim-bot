@@ -17,7 +17,7 @@ from datetime import datetime, timedelta
 _NAMES = ("q", "db", "LOCK", "send", "send_kb", "tg", "now", "esc", "log", "OWNER", "CFG", "TOKEN", "TZ",
           "emp", "emp_by_key", "emp_name", "active_employees", "is_workday", "at", "WORK_START", "WORK_END",
           "PENDING", "CSRF", "current_url", "parse_day", "once", "BASE", "DISC_URL", "DISC_SECRET",
-          "BRAND_HEAD", "BRAND_CSS", "brand_nav", "ic", "iconize", "IC_JS", "responsible", "sees_all")
+          "BRAND_HEAD", "BRAND_CSS", "brand_nav", "ic", "iconize", "IC_JS", "responsible", "sees_all", "role_of", "ROLES")
 
 ONLINE_SEC = 120          # shuncha soniya signal bo'lmasa — oflayn
 CMD_TTL = 600             # oflayn kompyuterga buyruq 10 daqiqa kutadi, keyin bekor bo'ladi
@@ -85,6 +85,12 @@ CREATE TABLE IF NOT EXISTS st_rules(k TEXT PRIMARY KEY, cat TEXT, created REAL);
 CREATE TABLE IF NOT EXISTS st_company(tg_id INTEGER, day TEXT, inn TEXT, company TEXT, page TEXT,
   secs INTEGER DEFAULT 0, PRIMARY KEY(tg_id, day, inn, page));
 -- Brauzerda har bir sayt (domen) va sahifa uchun aniq vaqt (hodimlar skriptidan, faqat faol tab)
+-- Faoliyat jurnali (daqiqalik): qaysi dastur/oyna, soat nechada — "nechadan nechagacha" uchun (90 kun saqlanadi)
+CREATE TABLE IF NOT EXISTS st_log(tg_id INTEGER, day TEXT, hm TEXT, app TEXT, title TEXT, secs INTEGER DEFAULT 0,
+  active INTEGER DEFAULT 0, PRIMARY KEY(tg_id, day, hm, app, title));
+-- Brauzer: soat nechada qaysi sahifa (havola — so'rov parametrlarisiz) va soliq kabinetida qaysi korxona
+CREATE TABLE IF NOT EXISTS st_weblog(tg_id INTEGER, day TEXT, hm TEXT, domain TEXT, title TEXT, url TEXT, inn TEXT,
+  secs INTEGER DEFAULT 0, PRIMARY KEY(tg_id, day, hm, domain, title));
 CREATE TABLE IF NOT EXISTS st_web(tg_id INTEGER, day TEXT, domain TEXT, title TEXT, secs INTEGER DEFAULT 0,
   PRIMARY KEY(tg_id, day, domain, title));
 """)
@@ -295,6 +301,14 @@ def api_web(body):
     q("INSERT INTO st_web(tg_id,day,domain,title,secs) VALUES(?,?,?,?,?) "
       "ON CONFLICT(tg_id,day,domain,title) DO UPDATE SET secs=secs+excluded.secs",
       (e["tg_id"], now().date().isoformat(), domain, title, secs))
+    # Havola: faqat sxema+domen+yo'l (so'rov parametrlari va # — olib tashlangan: tokenlar/shaxsiy ma'lumot bo'lishi mumkin)
+    url = str(body.get("url") or "")
+    m = re.match(r"^(https?://[^/?#\s]+(?:/[^?#\s]*)?)", url)
+    url = m.group(1)[:300] if m and domain in m.group(1).lower() else ""
+    n = now()
+    q("INSERT INTO st_weblog(tg_id,day,hm,domain,title,url,inn,secs) VALUES(?,?,?,?,?,?,NULL,?) "
+      "ON CONFLICT(tg_id,day,hm,domain,title) DO UPDATE SET secs=secs+excluded.secs, url=COALESCE(NULLIF(excluded.url,''),url)",
+      (e["tg_id"], n.date().isoformat(), n.strftime("%H:%M"), domain, title, url, secs))
     t = time.time()
     lw = LIVE_WEB.get(e["tg_id"])
     since = lw["since"] if lw and lw["domain"] == domain and t - lw["ts"] < 75 else t - secs
@@ -463,6 +477,115 @@ def report_emp_csv(kind, day, tg_id):
     return "﻿" + "\r\n".join(L) + "\r\n", f"samaradorlik-{safe}-{kind}-{a.isoformat()}.csv"
 
 
+def company_matcher():
+    """Ro'yxatdagi korxonalar + oyna/sahifa nomidan korxonani topuvchi funksiya."""
+    comps = {r["inn"]: r["name"] or r["inn"] for r in q("SELECT inn, name FROM companies WHERE COALESCE(active,1)=1")}
+    keys = sorted(((norm_name(n), inn) for inn, n in comps.items()), key=lambda kv: -len(kv[0]))
+    keys = [(k, inn) for k, inn in keys if len(k) >= 4]
+
+    def match(text):
+        if not text:
+            return None
+        hit = next((d for d in re.findall(r"\d{9}", text) if d in comps), None)
+        if hit:
+            return hit
+        t = " " + norm_name(text) + " "
+        return next((inn for k, inn in keys if f" {k} " in t), None)
+    return comps, match
+
+
+def _hm_add(hm, n=1):
+    m = int(hm[:2]) * 60 + int(hm[3:5]) + n
+    return f"{m // 60 % 24:02d}:{m % 60:02d}"
+
+
+def activity_log(tg_id, day):
+    """Faoliyat jurnali: kun davomida "nechadan nechagacha — qaysi dastur/sayt — qaysi korxona" bo'laklari.
+    Agentning daqiqalik yozuvi + brauzer skripti (sahifa, havola) + soliq kabineti (INN) birlashtiriladi."""
+    comps, match = company_matcher()
+    allmine = sees_all(tg_id)
+    mins, act = {}, {}
+    for r in q("SELECT hm, app, title, secs, active FROM st_log WHERE tg_id=? AND day=?", (tg_id, day)):
+        act[r["hm"]] = act.get(r["hm"], 0) + r["active"]
+        m = mins.get(r["hm"])
+        if not m or r["secs"] > m["secs"]:
+            mins[r["hm"]] = dict(r)
+    web, kab = {}, {}
+    for r in q("SELECT hm, domain, title, url, inn, secs FROM st_weblog WHERE tg_id=? AND day=?", (tg_id, day)):
+        if r["domain"] == "__kabinet__":
+            kab[r["hm"]] = r["inn"]
+        elif r["hm"] not in web or r["secs"] > web[r["hm"]]["secs"]:
+            web[r["hm"]] = dict(r)
+    rows = []
+    for hm in sorted(mins):
+        m = mins[hm]
+        app = m["app"] or "?"
+        if app.upper() in ("LOCKED", "BLOCKED"):
+            rows.append({"hm": hm, "label": app_label(app), "sub": "", "url": "", "inn": None, "cat": "x"})
+            continue
+        w = web.get(hm) or web.get(_hm_add(hm, 1)) if app.lower() in BROWSERS else None
+        if w:
+            label, sub, url = w["domain"], w["title"], w["url"] or ""
+        else:
+            label, sub, url = app_label(app), (site_of(m["title"]) if app.lower() in BROWSERS else m["title"]), ""
+        inn = kab.get(hm) or kab.get(_hm_add(hm, 1)) if (w and "soliq.uz" in w["domain"]) else None
+        inn = inn or match(m["title"]) or (match(w["title"]) if w else None)
+        cat = "i" if act.get(hm, 0) < 10 else classify(app, f"{label} {sub}" if w else m["title"])
+        rows.append({"hm": hm, "label": label, "sub": sub or "", "url": url, "inn": inn, "cat": cat})
+    # Ketma-ket daqiqalarni bo'laklarga birlashtirish (2 daqiqagacha uzilish — bitta bo'lak)
+    segs = []
+    for r in rows:
+        s = segs[-1] if segs else None
+        if s and s["label"] == r["label"] and s["inn"] == r["inn"] and (s["cat"] == "i") == (r["cat"] == "i") \
+                and int(r["hm"][:2]) * 60 + int(r["hm"][3:]) - (int(s["last"][:2]) * 60 + int(s["last"][3:])) <= 3:
+            s["last"] = r["hm"]
+            s["mins"] += 1
+            s["subs"][r["sub"]] = s["subs"].get(r["sub"], 0) + 1
+            if r["url"] and r["url"] not in s["urls"] and len(s["urls"]) < 5:
+                s["urls"].append(r["url"])
+        else:
+            segs.append({"from": r["hm"], "last": r["hm"], "mins": 1, "label": r["label"], "inn": r["inn"],
+                         "cat": r["cat"], "subs": {r["sub"]: 1}, "urls": [r["url"]] if r["url"] else []})
+    out, per_co = [], {}
+    for s in segs:
+        subs = [k for k, _v in sorted(s["subs"].items(), key=lambda kv: -kv[1]) if k][:3]
+        mine = bool(s["inn"]) and (allmine and s["inn"] in comps or responsible(s["inn"], day) == tg_id)
+        out.append({"from": s["from"], "to": _hm_add(s["last"]), "mins": s["mins"], "t": dur(s["mins"] * 60),
+                    "label": s["label"], "subs": subs, "urls": s["urls"],
+                    "company": comps.get(s["inn"], s["inn"]) if s["inn"] else "", "mine": mine,
+                    "cat": {"p": "work", "u": "distract", "i": "idle", "x": "idle"}.get(s["cat"], "neutral")})
+        if s["inn"] and s["cat"] != "i":
+            c = per_co.setdefault(s["inn"], {"name": comps.get(s["inn"], s["inn"]), "mins": 0, "first": s["from"],
+                                             "last": _hm_add(s["last"]), "times": 0, "mine": mine})
+            c["mins"] += s["mins"]
+            c["last"] = _hm_add(s["last"])
+            c["times"] += 1
+    active_mins = sum(1 for r in rows if r["cat"] not in ("i", "x"))
+    co_mins = sum(c["mins"] for c in per_co.values())
+    return {"segments": out,
+            "companies": [{"inn": k, **v, "t": dur(v["mins"] * 60)} for k, v in sorted(per_co.items(), key=lambda kv: -kv[1]["mins"])],
+            "co_mins": co_mins, "co_t": dur(co_mins * 60),
+            "co_share": round(100 * co_mins / active_mins) if active_mins >= 10 else None}
+
+
+def log_csv(tg_id, day):
+    """Bir kunlik faoliyat jurnali — Excel uchun."""
+    lg = activity_log(tg_id, day)
+    cat = {"work": "ish", "distract": "chalg'ish", "idle": "harakatsiz", "neutral": "boshqa"}
+
+    def line(vals):
+        return ";".join('"' + str(v).replace('"', '""') + '"' if any(c in str(v) for c in ';"\n') else str(v) for v in vals)
+    L = [line([f"{emp_name(tg_id)} — faoliyat jurnali", fmt_day(day)]),
+         line(["Korxonalar ishiga", lg["co_t"], f"{lg['co_share']}% faol vaqtdan" if lg["co_share"] is not None else ""]), "",
+         line(["Boshlandi", "Tugadi", "Davomiyligi", "Dastur / sayt", "Oyna / sahifa", "Korxona", "Kimniki", "Tur", "Havolalar"])]
+    for s in lg["segments"]:
+        L.append(line([s["from"], s["to"], dur(s["mins"] * 60), s["label"], " | ".join(s["subs"]), s["company"],
+                       ("o'zining" if s["mine"] else "boshqa hodimniki") if s["company"] else "", cat[s["cat"]],
+                       " ".join(s["urls"])]))
+    safe = re.sub(r"[^\w-]+", "_", emp_name(tg_id), flags=re.U).strip("_")[:40] or str(tg_id)
+    return "﻿" + "\r\n".join(L) + "\r\n", f"jurnal-{safe}-{day}.csv"
+
+
 WB_COL = {"mine": "#F28322", "work": "#22c55e", "neutral": "#60a5fa", "distract": "#ef4444", "idle": "#d6d3d1"}
 WB_NAME = {"mine": "Bizning korxonalar", "work": "Boshqa ish", "neutral": "Boshqa", "distract": "Chalg‘ish",
            "idle": "Harakatsiz"}
@@ -474,8 +597,12 @@ def wb_data(tg_id, day):
     d = datetime.strptime(day, "%Y-%m-%d").date()
     s = day_stats(day, tg_id).get(tg_id) or {}
     cd = company_data(tg_id, day)
+    lg = activity_log(tg_id, day)
     mine = sum(r["secs"] for r in cd["rows"] if r["mine"])
     other_co = sum(r["secs"] for r in cd["rows"] if not r["mine"])
+    if lg["companies"]:          # daqiqalik jurnal bor — aniqroq hisob shundan
+        mine = max(mine, sum(c["mins"] for c in lg["companies"] if c["mine"]) * 60)
+        other_co = max(other_co, sum(c["mins"] for c in lg["companies"] if not c["mine"]) * 60)
     act, prod, unprod, idle = s.get("active", 0), s.get("prod", 0), s.get("unprod", 0), s.get("idle", 0)
     mine = min(mine, act)
     work = max(0, prod - mine)
@@ -537,7 +664,21 @@ def wb_data(tg_id, day):
                     "site": None, "corp": corp_now(tg_id)}
             if lw and time.time() - lw["ts"] < 75:
                 live["site"] = {"domain": lw["domain"], "title": lw["title"], "secs": int(time.time() - lw["since"])}
+    co_time = {c["inn"]: c for c in lg["companies"]}
+    have = {c["inn"] for c in companies}
+    for x in lg["companies"]:     # jurnalda bor, lekin umumiy hisobda yo'q korxonalar ham ko'rinsin
+        if x["inn"] not in have:
+            companies.append({"name": x["name"], "inn": x["inn"], "mine": x["mine"], "secs": x["mins"] * 60, "t": x["t"]})
+        else:
+            c = next(c for c in companies if c["inn"] == x["inn"])
+            if x["mins"] * 60 > c["secs"]:
+                c["secs"], c["t"] = x["mins"] * 60, x["t"]
+    companies.sort(key=lambda c: -c["secs"])
+    for c in companies:          # korxonalar ro'yxatiga "nechadan nechagacha" qo'shiladi
+        x = co_time.get(c["inn"])
+        c["span"] = f"{x['first']}–{x['last']} · {x['times']} marta" if x else ""
     return {"name": emp_name(tg_id), "day": day, "dayf": fmt_day(day), "today": today, "exact": exact,
+            "log": lg["segments"], "co_t": lg["co_t"], "co_share": lg["co_share"], "role": role_of(tg_id),
             "total": s.get("on", 0), "active": act, "prev": prev, "span": s.get("span"),
             "seg": [{"k": k, "name": WB_NAME[k], "col": WB_COL[k], "secs": v, "t": dur(v)} for k, v in seg.items()],
             "other_co": dur(other_co), "mine_t": dur(mine),
@@ -585,6 +726,19 @@ WB_CSS = """
 .rw .pg{display:none;margin:8px 0 2px 50px}.rw.open .pg{display:block}
 .pgr{display:flex;justify-content:space-between;gap:12px;font-size:13px;padding:3px 0}.pgr span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .note2{font-size:13px;color:var(--mut);margin:10px 2px 0}
+.lhead{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:12px}.lhead .tabs2{margin:0}
+.lhead .btn{margin-left:auto}
+.lg-row{display:grid;grid-template-columns:112px 4px minmax(0,1fr);gap:14px;align-items:start;padding:11px 10px;border-radius:12px}
+.lg-row:hover{background:var(--acc-soft)}
+.lgt b{display:block;font-size:14px;font-weight:500;font-variant-numeric:tabular-nums}.lgt span{font-size:12.5px;color:var(--mut)}
+.lgc{width:4px;align-self:stretch;border-radius:4px}
+.lgl{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.lgl b{font-weight:500;font-size:15px}
+.lgm .ttl{max-width:100%}
+.lgu{display:flex;flex-direction:column;gap:2px;margin-top:4px}
+.lgu a{font-size:12.5px;color:var(--acc);text-decoration:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.lgu a:hover{text-decoration:underline}
+.tg{display:inline-block;padding:2px 9px;border-radius:999px;font-size:11.5px;font-weight:500;background:var(--line);color:var(--mut)}
+.tg.g{background:rgba(242,131,34,.14);color:#c2410c}.tg.y{background:var(--line);color:var(--mut)}
 @media (max-width:820px){.hero{grid-template-columns:1fr}.g2{grid-template-columns:1fr}}
 """
 
@@ -594,7 +748,7 @@ const E=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;
 const COL={mine:'#F28322',work:'#22c55e',neutral:'#60a5fa',distract:'#ef4444',idle:'#d6d3d1'};
 const fmt=s=>{s=Math.max(0,Math.round(s||0));const h=Math.floor(s/3600),m=Math.floor(s%3600/60);return h?`${h} soat ${m} daq`:(m?`${m} daq`:`${s} son`)};
 const clock=s=>{s=Math.max(0,Math.floor(s));const h=Math.floor(s/3600),m=Math.floor(s%3600/60),x=s%60;return (h?h+':':'')+String(m).padStart(h?2:1,'0')+':'+String(x).padStart(2,'0')};
-let D=null,TAB='sites',OPEN={},liveBase=0,liveAt=0;
+let D=null,TAB='log',OPEN={},liveBase=0,liveAt=0;
 function donut(){const C=2*Math.PI*90,tot=D.seg.reduce((a,b)=>a+b.secs,0)||1;let off=0;
  $$('#dn circle.s').forEach((c,i)=>{const v=D.seg[i].secs/tot*C;c.setAttribute('stroke',D.seg[i].col);
   c.style.strokeDasharray=`${Math.max(0,v-2)} ${C}`;c.style.strokeDashoffset=-off;off+=v});
@@ -603,8 +757,15 @@ function donut(){const C=2*Math.PI*90,tot=D.seg.reduce((a,b)=>a+b.secs,0)||1;let
   dl.className='delta '+(p>0?'up':'down');dl.textContent=(p>0?'+':'')+p+'% kechagiga nisbatan'}else dl.hidden=true;
  $('#lg').innerHTML=D.seg.map(s=>`<div class="lgr"><i style="background:${s.col}"></i><span>${E(s.name)}</span><b>${s.t}</b>
   <span class="pc">${Math.round(s.secs/tot*100)}%</span></div>`).join('')+
-  `<div class="note2">O‘z korxonalariga <b>${D.mine_t}</b> · boshqa hodimlarning korxonalariga <b>${D.other_co}</b>`+
-  (D.span?` · ${D.span[0]}–${D.span[1]}`:'')+`</div>`}
+  `<div class="note2">Korxonalar ishiga <b>${D.co_t}</b>${D.co_share!=null?` (<b>${D.co_share}%</b> faol vaqtdan)`:''}`+
+  ` · o‘z korxonalariga <b>${D.mine_t}</b> · boshqalarniki <b>${D.other_co}</b>`+(D.span?` · ${D.span[0]}–${D.span[1]}`:'')+`</div>`}
+function logList(){if(!D.log.length)return '<div class="note2">Bu kunda faoliyat yozilmagan</div>';
+ return D.log.slice().reverse().map(s=>{const k='l:'+s.from;
+  const links=s.urls.map(u=>`<a href="${E(u)}" target="_blank" rel="noopener noreferrer">${E(u.replace(/^https?:\/\//,'').slice(0,80))}</a>`).join('');
+  return `<div class="lg-row${OPEN[k]?' open':''}" data-k="${E(k)}"><div class="lgt"><b>${s.from}–${s.to}</b><span>${s.t}</span></div>
+  <i class="lgc" style="background:${COL[s.cat]}"></i><div class="lgm"><div class="lgl"><b>${E(s.label)}</b>
+  ${s.company?`<span class="tg ${s.mine?'g':'y'}">${E(s.company)}</span>`:''}</div>
+  <div class="sub ttl">${E(s.subs.join(' · '))}</div>${links?`<div class="lgu">${links}</div>`:''}</div></div>`}).join('')}
 function bars(el,items,keys,labels,maxv,hl){const W=el.clientWidth||600,H=190,b=24,n=items.length,gw=(W-30)/n,bw=Math.min(28,gw*.62);
  let s=`<line x1="30" y1="${H-b}" x2="${W}" y2="${H-b}" stroke="var(--line)"/>`;
  [.5,1].forEach(f=>{const y=(H-b)-(H-b-10)*f;s+=`<line x1="30" y1="${y}" x2="${W}" y2="${y}" stroke="var(--line)" stroke-dasharray="3 4"/><text x="0" y="${y+3}">${Math.round(maxv*f/60)}d</text>`});
@@ -618,9 +779,10 @@ function charts(){const hs=D.hours.filter(h=>h.h>=7&&h.h<=21);
  const mx=Math.max(3600,...wk.map(w=>w.active));
  bars($('#wc'),wk,['work','neutral','distract'],w=>w.label,Math.ceil(mx/3600)*3600,w=>w.day===D.day)}
 function lists(){let rows;
+ if(TAB==='log'){$('#ls').innerHTML=logList();$('#exact').textContent='Eng yangisi tepada. Havolalar — faqat sahifa manzili (parametrlarsiz).';return}
  if(TAB==='sites')rows=D.sites.map(x=>({k:'s:'+x.name,name:x.name,t:x.t,secs:x.secs,col:COL[x.cat],sub:x.pages}));
  else if(TAB==='corp')rows=D.companies.map(x=>({k:'c:'+x.inn,name:x.name,t:x.t,secs:x.secs,col:x.mine?COL.mine:COL.neutral,
-  tag:x.mine?'o‘zining':'boshqa hodimniki',sub:[]}));
+  tag:x.mine?'o‘zining':'boshqa hodimniki',sub:x.span?[{name:'Ishlagan vaqti: '+x.span,t:''}]:[]}));
  else rows=D.apps.map(x=>({k:'a:'+x.name,name:x.name,t:x.t,secs:x.secs,col:COL[x.cat],sub:[]}));
  const mx=Math.max(1,...rows.map(r=>r.secs));
  $('#ls').innerHTML=rows.length?rows.map(r=>`<div class="rw${OPEN[r.k]?' open':''}" data-k="${E(r.k)}"><div class="rwh">
@@ -658,7 +820,8 @@ def render_wb(tg_id, day):
     return f"""<!DOCTYPE html><html lang="uz"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>{esc(emp_name(tg_id))} · Raqamli muvozanat</title>{BRAND_HEAD}
 <style>{CSS}{BRAND_CSS}{WB_CSS}</style></head><body><div class="wrap">{brand_nav("screentime")}
-<div class="wbh"><div><a class="back" href="/screentime?d={day}">‹ Screen time</a><h1 style="margin-top:6px">{esc(emp_name(tg_id))}</h1>
+<div class="wbh"><div><a class="back" href="/screentime?d={day}">‹ Screen time</a><h1 style="margin-top:6px">{esc(emp_name(tg_id))}
+<span class="role r-{role_of(tg_id)}" style="font-size:13px;vertical-align:middle">{ROLES[role_of(tg_id)]}</span></h1>
 <div class="sub">Raqamli muvozanat — vaqt nimaga sarflanayotgani</div></div>
 <form class="pnav glass" method="get" action="/screentime/hodim"><input type="hidden" name="u" value="{tg_id}">
 <a href="/screentime/hodim?u={tg_id}&d={prev_d}" title="Oldingi kun">‹</a>
@@ -671,8 +834,9 @@ def render_wb(tg_id, day):
 <div class="live glass" id="live" hidden><span class="pulse"></span><div class="what" id="lvw"></div><div class="cnt" id="lvc"></div></div>
 <div class="g2"><div class="pane glass"><h3>Soatlar bo‘yicha</h3><svg class="chart" id="hc"></svg></div>
 <div class="pane glass"><h3>Oxirgi 7 kun</h3><svg class="chart" id="wc"></svg></div></div>
-<div class="pane glass" style="margin-top:14px"><div class="tabs2"><button class="on" data-t="sites">Saytlar</button>
-<button data-t="corp">Korxonalar</button><button data-t="apps">Dasturlar</button></div>
+<div class="pane glass" style="margin-top:14px"><div class="lhead"><div class="tabs2"><button class="on" data-t="log">Jurnal</button>
+<button data-t="corp">Korxonalar</button><button data-t="sites">Saytlar</button><button data-t="apps">Dasturlar</button></div>
+<a class="btn sm ghost" href="/screentime/log.csv?u={tg_id}&d={day}">{ic("download")}Jurnal (Excel)</a></div>
 <div class="rows" id="ls"></div><div class="note2" id="exact"></div></div>
 </div><script>const U={int(tg_id)},DAY="{day}";{WB_JS}</script></body></html>"""
 
@@ -700,6 +864,10 @@ def api_presence(body):
       "ON CONFLICT(tg_id,day,inn,page) DO UPDATE SET secs=secs+excluded.secs, company=excluded.company",
       (e["tg_id"], day, inn, company, page, secs))
     PRESENCE[e["tg_id"]] = (time.time(), inn, company, page)
+    n = now()       # jurnal uchun: shu daqiqada qaysi korxona kabinetida
+    q("INSERT INTO st_weblog(tg_id,day,hm,domain,title,url,inn,secs) VALUES(?,?,?,'__kabinet__',?,'',?,?) "
+      "ON CONFLICT(tg_id,day,hm,domain,title) DO UPDATE SET secs=secs+excluded.secs, inn=excluded.inn",
+      (e["tg_id"], n.date().isoformat(), n.strftime("%H:%M"), page, inn, secs))
     return 200, {"ok": True}
 
 
@@ -933,6 +1101,11 @@ def api_activity(body, ip):
         minutes.append((e["tg_id"], day, hm, s, a, app, classify(app, title), s))
     with LOCK:
         pc_id, prev = _touch_pc(e, body, ip, cur, t_now)
+        # Faoliyat jurnali: har daqiqa qaysi dastur/oyna (soat nechadan nechagacha ishlaganini ko'rsatish uchun)
+        db.executemany("INSERT INTO st_log(tg_id,day,hm,app,title,secs,active) VALUES(?,?,?,?,?,?,?) "
+                       "ON CONFLICT(tg_id,day,hm,app,title) DO UPDATE SET secs=secs+excluded.secs, "
+                       "active=active+excluded.active", [(u[0], u[1], m[2], u[2], u[3], u[4], u[5])
+                                                         for u, m in zip(usage, minutes)])
         db.executemany("INSERT INTO st_usage(tg_id,day,app,title,secs,active) VALUES(?,?,?,?,?,?) "
                        "ON CONFLICT(tg_id,day,app,title) DO UPDATE SET secs=secs+excluded.secs, "
                        "active=active+excluded.active", usage)
@@ -1297,7 +1470,10 @@ def tick(n):
         if q("SELECT 1 FROM st_usage WHERE day=? LIMIT 1", (d.isoformat(),), one=True):
             send(OWNER, summary_text(d.isoformat()))
     if n.hour == 4 and once(f"st_clean:{d}"):
-        q("DELETE FROM st_minutes WHERE day<?", ((d - timedelta(days=int(CFG.get("ST_KEEP_MINUTES_DAYS", 90)))).isoformat(),))
+        keep = (d - timedelta(days=int(CFG.get("ST_KEEP_MINUTES_DAYS", 90)))).isoformat()
+        q("DELETE FROM st_minutes WHERE day<?", (keep,))
+        q("DELETE FROM st_log WHERE day<?", (keep,))
+        q("DELETE FROM st_weblog WHERE day<?", (keep,))
         q("DELETE FROM st_usage WHERE day<?", ((d - timedelta(days=int(CFG.get("ST_KEEP_DAYS", 400)))).isoformat(),))
         q("DELETE FROM st_cmds WHERE created<?", (time.time() - 30 * 86400,))
 

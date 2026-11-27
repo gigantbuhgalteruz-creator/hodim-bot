@@ -3160,7 +3160,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._out(200, got[0], got[1], {"Cache-Control": "no-store"})
         if path not in ("/", "/dashboard", "/hisobotlar", "/hisobotlar.csv", "/screentime", "/screentime/shot",
                         "/screentime/live.json", "/screentime/detail.json", "/screentime/frame",
-                        "/screentime/hodim", "/screentime/wb.json", "/screentime/report.json", "/screentime/report.csv"):
+                        "/screentime/hodim", "/screentime/wb.json", "/screentime/report.json", "/screentime/report.csv",
+                        "/screentime/log.csv"):
             return self._out(404, "not found", "text/plain")
         # Avto-yangilanish (har daqiqa) faollik hisoblanmaydi — faqat foydalanuvchi sahifada nimadir qilgan bo'lsa.
         auto = qs.get("auto", [""])[0] == "1"
@@ -3178,6 +3179,15 @@ class Handler(BaseHTTPRequestHandler):
             if path.endswith(".json"):
                 return self._out(200, st.wb_data(int(u), day), extra={"Cache-Control": "no-store"})
             return self._out(200, st.render_wb(int(u), day), "text/html; charset=utf-8")
+        if path == "/screentime/log.csv":
+            u = qs.get("u", [""])[0]
+            day = parse_day(qs.get("d", [""])[0] or "") or now().date().isoformat()
+            if not u.isdigit() or not emp(int(u), active_only=False):
+                return self._out(404, "hodim topilmadi", "text/plain")
+            body, fname = st.log_csv(int(u), day)
+            return self._out(200, body, "text/csv; charset=utf-8",
+                             {"Content-Disposition": f"attachment; filename*=UTF-8''{urllib.parse.quote(fname)}",
+                              "Cache-Control": "no-store"})
         if path in ("/screentime/report.json", "/screentime/report.csv"):
             kind = "month" if qs.get("p", [""])[0] == "month" else "week"
             day = parse_day(qs.get("d", [""])[0] or "") or now().date().isoformat()

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Soliq.uz → Hodim bot: hisobotlar
 // @namespace    soliq-telegram
-// @version      5.0
+// @version      5.1
 // @description  Hodim soliq.uz kabinetida ishlayotganda hisobotlar jurnalini fonda tekshiradi va yangi/o'zgargan hisobotlarni bot serveriga yuboradi (bot ularni faqat ownerga jo'natadi).
 // @match        *://*/*
 // @grant        GM_xmlhttpRequest
@@ -58,7 +58,9 @@
       if (!key || !active || secs < 5) return;
       GM_xmlhttpRequest({ method: 'POST', url: base() + '/api/web', timeout: 15000,
         headers: { 'Content-Type': 'application/json' },
-        data: JSON.stringify({ key, domain: host, title: clean(document.title).slice(0, 120), secs: Math.min(secs, 90) }) });
+        // havola — faqat manzil va yo'l; so'rov parametrlari (?...) va # yuborilmaydi
+        data: JSON.stringify({ key, domain: host, title: clean(document.title).slice(0, 120), secs: Math.min(secs, 90),
+                               url: (location.origin + location.pathname).slice(0, 300) }) });
     }
     setInterval(beat, 30000);
     addEventListener('focus', () => { lastBeat = Date.now(); focused = true; });
