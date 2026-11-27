@@ -145,6 +145,9 @@ for _col, _typ in (("activity", "TEXT"), ("staff", "TEXT"), ("c1", "TEXT"), ("no
                    ("sort", "INTEGER"), ("active", "INTEGER DEFAULT 1")):
     if _col not in {r[1] for r in db.execute("PRAGMA table_info(companies)")}:
         db.execute(f"ALTER TABLE companies ADD COLUMN {_col} {_typ}")
+for _col, _typ in (("role", "TEXT DEFAULT 'hodim'"), ("pw_hash", "TEXT")):      # rollar (hodim / zam / boshliq)
+    if _col not in {r[1] for r in db.execute("PRAGMA table_info(employees)")}:
+        db.execute(f"ALTER TABLE employees ADD COLUMN {_col} {_typ}")
 db.commit()
 # Korxonalar ro'yxati faqat qo'lda to'ldiriladi (dashboard "+ Mijoz" yoki botda /firma).
 # active: 1 — bizning mijoz; 0 — karzinada (bildirishnoma kelmaydi, jadvalda yo'q; qaytarish yoki butunlay o'chirish mumkin).
@@ -182,6 +185,80 @@ def emp_by_key(key):
 
 def active_employees():
     return q("SELECT * FROM employees WHERE active=1 ORDER BY name")
+
+
+# ---------------------------------------------------------------- rollar
+# hodim — o'ziga biriktirilgan korxonalar; zam — barcha korxonalar uniki;
+# boshliq — barcha korxonalar uniki + rahbar huquqlari (bot xabarlari, bot buyruqlari, dashboard), davomatdan ozod.
+ROLES = {"hodim": "Hodim", "zam": "ZAM", "boshliq": "Boshliq"}
+_ctx = threading.local()      # .admin — hozir buyruq bergan rahbar (javob faqat unga boradi)
+
+
+def role_of(tg_id):
+    r = q("SELECT role FROM employees WHERE tg_id=?", (tg_id,), one=True)
+    return (r["role"] if r and r["role"] in ROLES else "hodim")
+
+
+def sees_all(tg_id):
+    """ZAM va Boshliq uchun barcha korxonalar "o'ziniki" hisoblanadi."""
+    return role_of(tg_id) in ("zam", "boshliq")
+
+
+def boss_ids():
+    return [r["tg_id"] for r in q("SELECT tg_id FROM employees WHERE active=1 AND role='boshliq'")]
+
+
+def is_admin(uid):
+    return uid == OWNER or uid in boss_ids()
+
+
+def admin_targets(owner_only=False):
+    """send(OWNER, ...) qayerga boradi: buyruqqa javob — faqat buyruq bergan rahbarga;
+    boshqa xabarlar (hisobotlar, ogohlantirishlar) — rahbar va barcha boshliqlarga."""
+    a = getattr(_ctx, "admin", None)
+    if a:
+        return [a]
+    return [OWNER] if owner_only else [OWNER] + [b for b in boss_ids() if b != OWNER]
+
+
+def _pw_hash(pw, salt=None):
+    salt = salt or secrets.token_hex(8)
+    h = __import__("hashlib").pbkdf2_hmac("sha256", pw.encode(), salt.encode(), 120000).hex()
+    return f"{salt}${h}"
+
+
+def _pw_ok(pw, stored):
+    try:
+        salt, _h = (stored or "").split("$", 1)
+    except ValueError:
+        return False
+    return secrets.compare_digest(_pw_hash(pw, salt), stored)
+
+
+def issue_boss_password(tg_id):
+    """Boshliqqa dashboard paroli yaratib, faqat unga Telegram'da yuboradi (bazada faqat xeshi saqlanadi)."""
+    pw = "-".join(secrets.token_hex(2) for _ in range(3))
+    q("UPDATE employees SET pw_hash=? WHERE tg_id=?", (_pw_hash(pw), tg_id))
+    return tg("sendMessage", chat_id=tg_id, parse_mode="HTML", disable_web_page_preview=True,
+              text=f"🔐 <b>Sizga boshliq huquqlari berildi</b>\n\nDashboard: {current_url()}\n"
+                   f"Login: <code>{tg_id}</code>\nParol: <code>{pw}</code>\n\n"
+                   f"Parolni hech kimga bermang. Yangi parol: /parol\n"
+                   f"Botda rahbar buyruqlari ham ochiq: /help") is not None
+
+
+def set_role(tg_id, role):
+    """Rolni o'zgartiradi. Boshliq bo'lsa — parol yuboriladi; boshliqlikdan olinsa — parol va sessiyalari o'chadi."""
+    if role not in ROLES or not emp(tg_id):
+        return False
+    old = role_of(tg_id)
+    q("UPDATE employees SET role=? WHERE tg_id=?", (role, tg_id))
+    if role == "boshliq" and old != "boshliq":
+        issue_boss_password(tg_id)
+    if old == "boshliq" and role != "boshliq":
+        q("UPDATE employees SET pw_hash=NULL WHERE tg_id=?", (tg_id,))
+        for t in [t for t, who in list(SESS_WHO.items()) if who == tg_id]:
+            session_end(t)
+    return True
 
 
 def emp_name(tg_id):
@@ -276,8 +353,18 @@ def tg(method, **params):
     return None
 
 
-def send(chat, text):
-    """Send HTML text, splitting messages longer than Telegram's limit."""
+def send(chat, text, owner_only=False):
+    """Send HTML text, splitting messages longer than Telegram's limit.
+    chat == OWNER — rahbarlarga (admin_targets: buyruq javobi faqat so'raganga, xabarlar — rahbar + boshliqlarga)."""
+    if chat == OWNER:
+        ok = False
+        for t in admin_targets(owner_only):
+            ok = _send_one(t, text) or ok
+        return ok
+    return _send_one(chat, text)
+
+
+def _send_one(chat, text):
     chunks, cur = [], ""
     for line in text.split("\n"):
         if len(cur) + len(line) + 1 > 3900:
@@ -331,6 +418,9 @@ def add_violation(e, d, kind, detail):
 # ---------------------------------------------------------------- attendance
 def handle_video(msg, e):
     uid = e["tg_id"]
+    if e["role"] == "boshliq":
+        send(uid, "Siz boshliqsiz — davomat videosi talab qilinmaydi 🙂")
+        return
     if msg.get("forward_origin") or msg.get("forward_date") or msg.get("forward_from"):
         send(uid, "❌ Qayta yuborilgan (forward) video qabul qilinmaydi. Hozir yangi yumaloq video yozing.")
         return
@@ -362,6 +452,8 @@ def handle_video(msg, e):
 
 def mark_absent(d):
     for e in active_employees():
+        if e["role"] == "boshliq":       # boshliq davomatdan ozod
+            continue
         if q("SELECT 1 FROM checkins WHERE tg_id=? AND day=?", (e["tg_id"], d.isoformat()), one=True):
             continue
         q("INSERT INTO checkins(tg_id,day,ts,status) VALUES(?,?,?,?)",
@@ -386,6 +478,8 @@ def stats(a, b):
         first = q("SELECT MIN(day) d FROM checkins WHERE tg_id=?", (e["tg_id"],), one=True)["d"]
         joined = min(filter(None, [(e["created"] or "")[:10], first]), default=a.isoformat())
         counted = [d for d in all_counted if d.isoformat() >= joined]
+        if e["role"] == "boshliq":       # boshliq davomatdan ozod — samaradorlik/jarima hisoblanmaydi
+            counted = []
         on_time = sum(1 for d in counted if by.get(d.isoformat()) and by[d.isoformat()]["status"] == "on_time")
         late = sum(1 for d in counted if by.get(d.isoformat()) and by[d.isoformat()]["status"] == "late")
         absent = sum(1 for d in counted if by.get(d.isoformat()) and by[d.isoformat()]["status"] == "absent")
@@ -433,6 +527,8 @@ def morning_text():
     d = now().date()
     came, late, missing = [], [], []
     for e in active_employees():
+        if e["role"] == "boshliq":
+            continue
         r = q("SELECT * FROM checkins WHERE tg_id=? AND day=?", (e["tg_id"], d.isoformat()), one=True)
         if not r:
             missing.append(e["name"])
@@ -499,7 +595,9 @@ def handle_report(e, body):
     if body.get("silent"):   # skript eski hisobotlarni jadval uchun yubordi — Telegram'ga xabar shart emas
         return 200, {"ok": True, "silent": True}
     resp = responsible(inn, report_day(rec, now().isoformat()))   # hisobot sanasidagi mas'ul hodim
-    if resp is None:
+    if sees_all(e["tg_id"]):            # ZAM / Boshliq — barcha korxonalar uniki
+        note = ""
+    elif resp is None:
         note = "⚠️ Bu firma hech bir hodimga biriktirilmagan"
     elif resp != e["tg_id"]:
         note = f"⚠️ Bu firma boshqa hodimga biriktirilgan: {esc(emp_name(resp))}"
@@ -921,9 +1019,13 @@ def kb(rows):
     return {"inline_keyboard": [[{"text": t, "callback_data": d} for t, d in row] for row in rows]}
 
 
-def send_kb(chat, text, rows):
-    return tg("sendMessage", chat_id=chat, text=text, parse_mode="HTML",
-              disable_web_page_preview=True, reply_markup=kb(rows)) is not None
+def send_kb(chat, text, rows, owner_only=False):
+    targets = admin_targets(owner_only) if chat == OWNER else [chat]
+    ok = False
+    for t in targets:
+        ok = tg("sendMessage", chat_id=t, text=text, parse_mode="HTML",
+                disable_web_page_preview=True, reply_markup=kb(rows)) is not None or ok
+    return ok
 
 
 def ask_company_employee():
@@ -1045,9 +1147,23 @@ def history_text(inn=None, uid=None):
 
 def handle_callback(cq):
     tg("answerCallbackQuery", callback_query_id=cq["id"])
-    if cq.get("from", {}).get("id") != OWNER:
+    uid = cq.get("from", {}).get("id")
+    if not is_admin(uid):
         return
+    _ctx.admin = uid            # tugma natijasi — faqat bosgan rahbarga
+    try:
+        _handle_callback(cq)
+    finally:
+        _ctx.admin = None
+
+
+def _handle_callback(cq):
     data = cq.get("data") or ""
+    if data.startswith("cmd:"):              # menyu tugmasi -> buyruq
+        PENDING.clear()
+        return handle_owner(data[4:])
+    if data.startswith("hint:"):
+        return send(OWNER, HINTS.get(data[5:], ""))
     if login_callback(cq, data) or st.handle_callback(data):
         return
     p = data.split(":")
@@ -1094,7 +1210,8 @@ def handle_callback(cq):
 
 
 # ---------------------------------------------------------------- bot commands
-OWNER_HELP = f"""👑 <b>Owner buyruqlari</b>
+OWNER_HELP = f"""👑 <b>Rahbar buyruqlari</b>
+Pastdagi tugmalar orqali ham ishlatish mumkin (/menu).
 
 <b>Hodimlar</b>
 /add TG_ID Ism Familiya — hodim qo'shish
@@ -1131,6 +1248,49 @@ OWNER_HELP = f"""👑 <b>Owner buyruqlari</b>
 Ish vaqti: {WORK_START}–{WORK_END}, hodim {WORK_START} gacha yumaloq video yuboradi."""
 
 
+# ---------------------------------------------------------------- tugmali menyu (pastdagi doimiy klaviatura)
+# Yozma buyruqlar ham ishlayveradi; tugma bosilsa — o'sha buyruq bajariladi.
+MENU = {
+    "👥 Hodimlar": ("Hodimlar", [[("➕ Hodim qo'shish", "cmd:/add"), ("🚪 Ishdan bo'shatish", "cmd:/remove")],
+                                [("📋 Ro'yxat", "cmd:/list"), ("💰 Maosh belgilash", "hint:salary")],
+                                [("🙏 Jarimani bekor qilish", "hint:forgive")]]),
+    "🏢 Korxonalar": ("Korxonalar", [[("➕ Hodimga biriktirish", "cmd:/firma"), ("⇄ Ko'chirish", "cmd:/kochir")],
+                                    [("📜 Tarix", "cmd:/tarix"), ("📋 Topshirilmaganlar", "cmd:/qarz")]]),
+    "📊 Davomat": ("Davomat va hisobotlar", [[("📅 Bugun", "cmd:/today"), ("🗓 Hafta", "cmd:/week"), ("📆 Oy", "cmd:/month")],
+                                            [("📈 Dashboard havolasi", "cmd:/dashboard")]]),
+    "🖥 Kompyuterlar": ("Kompyuterlar (screen time)", [[("⏱ Bugungi screen time", "cmd:/screen"), ("📡 Hozir kim nima qilyapti", "cmd:/onlayn")],
+                                                       [("⛔ Boshqarish (blok, xabar)", "cmd:/pc"), ("🧩 Agent o'rnatish", "cmd:/agent")]]),
+    "🔐 Xavfsizlik": ("Dashboard xavfsizligi", [[("📱 Ishonchli qurilmalar", "cmd:/qurilmalar"), ("🚫 Bloklangan IP", "cmd:/ipblok")],
+                                               [("🚪 Hammani chiqarish", "cmd:/chiqar")]]),
+}
+HINTS = {"salary": "💰 Maosh: <code>/salary TG_ID SUMMA</code>\nMasalan: <code>/salary 1822803285 5000000</code>\n"
+                   "(TG_ID — 👥 Hodimlar → 📋 Ro'yxat da bor)",
+         "forgive": "🙏 Oxirgi qoidabuzarlikni bekor qilish: <code>/forgive TG_ID</code>"}
+EMP_MENU = ["📊 Statistikam", "🔑 Skript kaliti", "🧩 Agent o'rnatish"]
+EMP_MENU_CMD = {"📊 Statistikam": "/me", "🔑 Skript kaliti": "/key", "🧩 Agent o'rnatish": "/agent"}
+
+
+def admin_keyboard(boss=False):
+    rows = [["👥 Hodimlar", "🏢 Korxonalar"], ["📊 Davomat", "🖥 Kompyuterlar"], ["🔐 Xavfsizlik", "❓ Yordam"]]
+    if boss:
+        rows.append(EMP_MENU[:2])        # boshliq — hodim sifatida ham
+    return {"keyboard": rows, "resize_keyboard": True, "is_persistent": True}
+
+
+def emp_keyboard():
+    return {"keyboard": [EMP_MENU[:2], EMP_MENU[2:]], "resize_keyboard": True, "is_persistent": True}
+
+
+def send_menu(chat, text, boss=False):
+    return tg("sendMessage", chat_id=chat, text=text, parse_mode="HTML", disable_web_page_preview=True,
+              reply_markup=admin_keyboard(boss)) is not None
+
+
+def menu_section(chat, label):
+    title, rows = MENU[label]
+    tg("sendMessage", chat_id=chat, text=f"<b>{title}</b>", parse_mode="HTML", reply_markup=kb(rows))
+
+
 def handle_owner(text):
     parts = text.split()
     cmd = parts[0].split("@")[0].lower()
@@ -1144,8 +1304,13 @@ def handle_owner(text):
 
     if st.handle_command(cmd, args):
         return
-    if cmd in ("/start", "/help"):
-        send(OWNER, OWNER_HELP)
+    if cmd in ("/start", "/menu"):
+        me = getattr(_ctx, "admin", None) or OWNER
+        send_menu(me, "👋 Pastdagi tugmalardan bo'limni tanlang.\nYozma buyruqlar ham ishlaydi: /help",
+                  boss=me != OWNER)
+    elif cmd == "/help":
+        me = getattr(_ctx, "admin", None) or OWNER
+        send_menu(me, OWNER_HELP, boss=me != OWNER)
     elif cmd == "/add" and not args:
         PENDING["add"] = True
         send_kb(OWNER, "👷 Yangi hodimning <b>Telegram ID</b> va <b>ismini</b> yozing:\n"
@@ -1339,21 +1504,40 @@ def handle_update(u):
         return
     uid = msg["from"]["id"]
     text = (msg.get("text") or "").strip()
+    admin = is_admin(uid)
+    _ctx.admin = uid if admin else None     # rahbar/boshliq buyrug'iga javob — faqat o'ziga
+    try:
+        return _handle_message(msg, uid, text, admin)
+    finally:
+        _ctx.admin = None
 
-    if uid == OWNER and text.startswith("/"):
+
+def _handle_message(msg, uid, text, admin):
+    if text in EMP_MENU_CMD:                 # hodim menyusi tugmalari -> buyruq
+        text = EMP_MENU_CMD[text]
+    if admin and text in MENU:               # rahbar menyusi: bo'lim tugmasi -> shu bo'lim amallari
+        return menu_section(uid, text)
+    if admin and text == "❓ Yordam":
+        text = "/help"
+    cmd0 = text.split()[0].split("@")[0].lower() if text.startswith("/") else ""
+    if uid != OWNER and admin and cmd0 == "/parol":          # boshliq o'ziga yangi dashboard paroli
+        issue_boss_password(uid)
+        return
+    # Boshliq ham hodim: /key, /me, /agent — hodim sifatida javob oladi
+    if admin and text.startswith("/") and not (uid != OWNER and cmd0 in ("/key", "/me", "/agent")):
         PENDING.clear()  # yangi buyruq — kutilayotgan kiritish bekor
         # Bir xabarda bir nechta buyruq bo'lsa (har biri yangi qatorda) — bittadan bajariladi.
         for line in text.splitlines():
             if line.strip().startswith("/"):
                 handle_owner(line.strip())
         return
-    if uid == OWNER and text and PENDING.pop("add", None):
+    if admin and text and PENDING.pop("add", None):
         return handle_owner("/add " + text)
-    if uid == OWNER and text and "pcmsg" in PENDING:
+    if admin and text and "pcmsg" in PENDING:
         return st.finish_msg(PENDING.pop("pcmsg"), text)
-    if uid == OWNER and text and "assign" in PENDING:
+    if admin and text and "assign" in PENDING:
         return finish_company_lines(text)
-    if uid == OWNER and text and "date" in PENDING:
+    if admin and text and "date" in PENDING:
         day = parse_day(text)
         if day is None:
             return send(OWNER, "Sana noto'g'ri. Masalan: <code>01.11.2026</code>")
@@ -1383,8 +1567,10 @@ def handle_update(u):
         a, b = week_range()
         s = next((x for x in stats(a, b) if x["e"]["tg_id"] == uid), None)
         eff = "—" if not s or s["eff"] is None else f"{s['eff']}%"
-        return send(uid, f"👷 {esc(e['name'])}\nShu hafta samaradorlik: <b>{eff}</b>\n"
-                         f"📹 Har ish kuni {WORK_START} gacha yumaloq video yuboring.\n/key — skript kaliti")
+        return tg("sendMessage", chat_id=uid, parse_mode="HTML", reply_markup=(admin_keyboard(True) if admin else emp_keyboard()),
+                  text=f"👷 {esc(e['name'])}\nShu hafta samaradorlik: <b>{eff}</b>\n"
+                       + ("" if e["role"] == "boshliq" else f"📹 Har ish kuni {WORK_START} gacha yumaloq video yuboring.\n")
+                       + "/key — skript kaliti")
     send(uid, f"📹 Davomat uchun yumaloq video yuboring ({WORK_START} gacha). /me — statistikangiz")
 
 
@@ -1456,13 +1642,15 @@ FLASH = {"emp_ok": "✅ Hodim qo'shildi", "emp_nosend": "✅ Hodim qo'shildi, le
          "tr_ok": "✅ Korxonalar ko'chirildi — eski hisobotlar avvalgi hodim nomida qoldi",
          "tr_none": "⚠️ Ko'chirish uchun korxona tanlanmadi", "bad_day": "⚠️ Sana noto'g'ri",
          "fire_ok": "✅ Hodim ishdan bo'shatildi — ismi va tarixi saqlandi", "same": "⚠️ Hodim o'ziga ko'chirilmaydi",
-         "stale": "⚠️ Sahifa eskirgan edi — yangilandi. Iltimos, qayta kiriting."}
+         "stale": "⚠️ Sahifa eskirgan edi — yangilandi. Iltimos, qayta kiriting.",
+         "role_ok": "✅ Rol o'zgartirildi", "role_denied": "⚠️ Rolni faqat rahbar o'zgartira oladi"}
 
 
 # ---- login sessiyalari: har kirish 1 soat amal qiladi, keyin qayta login so'raladi
 SESSION_COOKIE = "hb_session"
 SESSION_TTL = int(CFG.get("SESSION_MINUTES", 60)) * 60
 SESSIONS = {}   # token -> tugash vaqti (unix). Bot qayta yonsa hamma qayta kiradi.
+SESS_WHO = {}   # token -> "owner" yoki boshliqning tg_id si
 SECURITY_HEADERS = {"X-Frame-Options": "DENY", "X-Content-Type-Options": "nosniff",
                     "Referrer-Policy": "no-referrer", "Cache-Control": "no-store"}
 
@@ -1491,6 +1679,7 @@ def session_valid(token, touch=False):
 
 def session_end(token):
     SESSIONS.pop(token or "", None)
+    SESS_WHO.pop(token or "", None)
 
 
 # Telegram'dagi kirish ogohlantirishidan rahbar begona kirishni chiqarib yuborishi va IP ni bloklashi mumkin
@@ -1539,7 +1728,8 @@ def login_callback(cq, data):
         return False
     mid = (cq.get("message") or {}).get("message_id")
     if mid and p[0] != "lunb":
-        tg("editMessageReplyMarkup", chat_id=OWNER, message_id=mid, reply_markup={"inline_keyboard": []})
+        tg("editMessageReplyMarkup", chat_id=((cq.get("message") or {}).get("chat") or {}).get("id", OWNER),
+           message_id=mid, reply_markup={"inline_keyboard": []})
     if p[0] == "lok":
         info = LOGINS.pop(p[1], None) if len(p) == 2 else None
         if info and info.get("dev"):
@@ -1651,6 +1841,11 @@ font-weight:500!important;border-radius:12px!important;box-shadow:none!important
 box-shadow:none!important;backdrop-filter:none!important;-webkit-backdrop-filter:none!important}
 .btn.ghost:hover{background:var(--glass)!important;border-color:var(--mut)!important;filter:none}
 .btn.red,.btn.stop{background:#d4321c!important}.btn.ok{background:#16a34a!important}
+select.role,span.role{font:inherit;font-size:13px;font-weight:500;padding:5px 10px;border-radius:9px;border:1px solid var(--line);
+background:var(--glass);color:var(--ink);cursor:pointer;width:auto;margin:0;display:inline-block}
+.role.r-zam{background:rgba(96,165,250,.14);border-color:rgba(96,165,250,.4);color:#1d4ed8}
+.role.r-boshliq{background:rgba(242,131,34,.14);border-color:rgba(242,131,34,.45);color:#c2410c}
+.rolef{margin:0}
 .ibtn{display:inline-grid;place-items:center;width:34px;height:34px;border-radius:10px;border:1px solid var(--line);
 background:var(--glass);color:var(--ink);cursor:pointer;text-decoration:none;transition:background .2s,border-color .2s}
 .ibtn:hover{border-color:var(--mut);background:var(--solid)}.ibtn .ic{margin:0;width:17px;height:17px}
@@ -1776,7 +1971,19 @@ def status_pill(status, error_reason=None):
             f'<div class="sub">{esc(status or "")}</div>')
 
 
-def render_dashboard(flash=""):
+def role_cell(e, editable):
+    """Davomat jadvalidagi "Rol" katagi: rahbar uchun tanlov, boshqalarga faqat matn."""
+    r = e["role"] if e["role"] in ROLES else "hodim"
+    if not editable:
+        return f'<span class="role r-{r}">{ROLES[r]}</span>'
+    opts = "".join(f'<option value="{k}"{" selected" if k == r else ""}>{v}</option>' for k, v in ROLES.items())
+    return (f'<form method="post" action="/dashboard/role" class="rolef"><input type="hidden" name="csrf" value="{CSRF}">'
+            f'<input type="hidden" name="tg_id" value="{e["tg_id"]}"><select name="role" class="role r-{r}" '
+            f'onchange="if(this.value!==\'boshliq\'||confirm(\'Boshliq: bot xabarlari, bot buyruqlari va dashboard huquqi beriladi. '
+            f'Paroli unga Telegram orqali yuboriladi. Davom etamizmi?\'))this.form.submit();else this.value=\'{r}\'">{opts}</select></form>')
+
+
+def render_dashboard(flash="", is_owner=True):
     a, b = week_range()
     d = now().date()
     ma = d.replace(day=1)
@@ -1801,7 +2008,8 @@ def render_dashboard(flash=""):
         lvl = lvl_txt.get(m["level"], "")
         rows.append(f"""<tr>
 <td><b>{esc(s['e']['name'])}</b><div class="sub">ID {s['e']['tg_id']} · <a href="/screentime?u={s['e']['tg_id']}" style="color:var(--acc);font-weight:600;text-decoration:none">{ic("desktop")}Kompyuter</a></div></td>
-<td>{today}</td>
+<td>{role_cell(s['e'], is_owner)}</td>
+<td>{today if s['e']['role'] != 'boshliq' else '<span class="sub">davomatdan ozod</span>'}</td>
 <td>{pill(s['eff'])}</td>
 <td>{s['on_time']} / {s['late']} / {s['absent']}</td>
 <td>{pill(m['eff'])}</td>
@@ -1945,9 +2153,9 @@ padding:10px 13px;border-radius:12px;border:1px solid var(--line);background:var
 <div class="kpi glass"><span class="mut">Haftalik o'rtacha samaradorlik</span><b>{'—' if avg is None else str(avg) + '%'}</b></div>
 </div>
 <h2>Hodimlar</h2><div class="card glass"><table><tr>
-<th>Hodim</th><th>Bugun</th><th>Hafta samaradorligi</th><th>Hafta: vaqtida / kech / kelmagan</th>
+<th>Hodim</th><th>Rol</th><th>Bugun</th><th>Hafta samaradorligi</th><th>Hafta: vaqtida / kech / kelmagan</th>
 <th>Oy samaradorligi</th><th>Oy qoidabuzarlik</th><th>Oy jarima</th><th>Firmalar</th><th>Oy hisobotlari</th></tr>
-{''.join(rows) or '<tr><td colspan=9 class="mut">Hodimlar yo‘q — “+ Hodim qo‘shish” tugmasini bosing</td></tr>'}
+{''.join(rows) or '<tr><td colspan=10 class="mut">Hodimlar yo‘q — “+ Hodim qo‘shish” tugmasini bosing</td></tr>'}
 </table></div>
 <h2>Hodimlar va korxonalar</h2>
 <div class="team">{''.join(team) or '<div class="member glass mut">Hodimlar yo‘q</div>'}</div>
@@ -2700,6 +2908,12 @@ class Handler(BaseHTTPRequestHandler):
         f = {k: v[0] for k, v in urllib.parse.parse_qs(raw.decode("utf-8", "replace")).items()}
         ok = bool(DASH_PASSWORD) and secrets.compare_digest(f.get("password", ""), DASH_PASSWORD) and (
             not DASH_USER or secrets.compare_digest(f.get("username", "").strip(), DASH_USER))
+        who = "owner"
+        if not ok:      # Boshliq: login — Telegram ID, parol — bot yuborgan
+            un = f.get("username", "").strip()
+            b = emp(int(un)) if un.isdigit() else None
+            if b and b["role"] == "boshliq" and b["pw_hash"] and _pw_ok(f.get("password", ""), b["pw_hash"]):
+                ok, who = True, b["tg_id"]
         if not ok:
             fails.append(t)
             LOGIN_FAILS[ip] = fails
@@ -2711,7 +2925,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._go("/login?e=bad")
         LOGIN_FAILS.pop(ip, None)
         token = session_new()
-        log("LOGIN", ip)
+        SESS_WHO[token] = who
+        log("LOGIN", ip, who)
         # Har muvaffaqiyatli kirish haqida rahbarga xabar — begona odam kirsa darhol bilinadi
         ua = self.headers.get("User-Agent", "")
         dev = next((n for k, n in (("iPhone", "iPhone"), ("iPad", "iPad"), ("Android", "Android"), ("Windows", "Windows"),
@@ -2722,20 +2937,25 @@ class Handler(BaseHTTPRequestHandler):
         devid = self._cookie(DEVICE_COOKIE)
         if not re.fullmatch(r"[A-Za-z0-9_-]{20,64}", devid or ""):
             devid = secrets.token_urlsafe(24)
-        label = f"{dev}{(' · ' + brw) if brw else ''}"
+        boss = who != "owner"
+        label = (f"Boshliq {emp_name(who)} · " if boss else "") + f"{dev}{(' · ' + brw) if brw else ''}"
+        tkey = f"{who}:{devid}" if boss else devid          # boshliq qurilmasi alohida eslab qolinadi
         trusted = trusted_devices()
-        if devid in trusted:
-            trusted[devid]["last"] = now().strftime("%d.%m.%Y %H:%M")
+        if tkey in trusted:
+            trusted[tkey]["last"] = now().strftime("%d.%m.%Y %H:%M")
             save_trusted(trusted)
         else:
             lid = secrets.token_hex(4)
-            LOGINS[lid] = {"token": token, "ip": ip, "dev": devid, "label": label}
+            LOGINS[lid] = {"token": token, "ip": ip, "dev": tkey, "label": label}
             for k in list(LOGINS)[:-50]:          # faqat oxirgi 50 ta kirish eslab qolinadi
                 LOGINS.pop(k, None)
+            # Kirish ogohlantirishi faqat rahbarga (eng yuqori huquq egasiga)
             send_kb(OWNER, f"🔐 <b>Yangi qurilmadan kirildi</b>: {now():%d.%m %H:%M} · {esc(label)} · IP {esc(ip)}\n"
-                           f"Bu siz bo'lsangiz — <b>✅ Bu men</b> ni bosing, shu qurilmadan boshqa xabar kelmaydi.",
+                           + ("Tanish bo'lsa — <b>✅ Tanish qurilma</b> ni bosing, boshqa xabar kelmaydi." if boss else
+                              "Bu siz bo'lsangiz — <b>✅ Bu men</b> ni bosing, shu qurilmadan boshqa xabar kelmaydi."),
                     [[("🚫 Chiqarib yuborish va bloklash", f"lkick:{lid}")],
-                     [("✅ Bu men", f"lok:{lid}"), ("🚪 Hammani chiqarish", "lall")]])
+                     [("✅ Tanish qurilma" if boss else "✅ Bu men", f"lok:{lid}"), ("🚪 Hammani chiqarish", "lall")]],
+                    owner_only=True)
         # Sessiya cookie: Max-Age yo'q — brauzer yopilsa o'chadi; muddatni server nazorat qiladi
         self._go("/dashboard", [f"{SESSION_COOKIE}={token}; Path=/; HttpOnly; Secure; SameSite=Strict",
                                 f"{DEVICE_COOKIE}={devid}; Path=/; Max-Age=63072000; HttpOnly; Secure; SameSite=Strict"])
@@ -2768,6 +2988,17 @@ class Handler(BaseHTTPRequestHandler):
             per = f.get("p", "")
             per = per if re.match(r"^\d{4}-(0[1-9]|1[0-2])$", per) else f"{now():%Y-%m}"
             return self._go(f"/hisobotlar?p={per}&m={matrix_post(path, f, fl)}")
+        if path == "/dashboard/role":
+            if SESS_WHO.get(self._cookie(), "owner") != "owner":
+                return self._redirect("role_denied")          # rolni faqat rahbar o'zgartiradi
+            uid, role = f.get("tg_id", ""), f.get("role", "")
+            if not uid.isdigit() or not set_role(int(uid), role):
+                return self._redirect("no_emp")
+            log("ROLE", uid, role)
+            send(OWNER, f"👤 {esc(emp_name(int(uid)))} — rol: <b>{ROLES[role]}</b>"
+                        + (" (dashboard login va paroli unga Telegram'da yuborildi)" if role == "boshliq" else ""),
+                 owner_only=True)
+            return self._redirect("role_ok")
         if path == "/dashboard/add_employee":
             uid, name = f.get("tg_id", "").strip(), " ".join(f.get("name", "").split())[:80]
             if not uid.isdigit():
@@ -2997,7 +3228,8 @@ class Handler(BaseHTTPRequestHandler):
                                  {"Content-Disposition": f'attachment; filename="hisobotlar-{kind or "jadval"}-{per}.csv"',
                                   "Cache-Control": "no-store"})
             return self._out(200, render_matrix(per, qs.get("m", [""])[0]), "text/html; charset=utf-8")
-        self._out(200, render_dashboard(qs.get("m", [""])[0]), "text/html; charset=utf-8")
+        self._out(200, render_dashboard(qs.get("m", [""])[0], is_owner=SESS_WHO.get(self._cookie(), "owner") == "owner"),
+                  "text/html; charset=utf-8")
 
 
 class DiscoveryHandler(BaseHTTPRequestHandler):

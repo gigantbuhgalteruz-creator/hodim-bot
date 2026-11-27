@@ -17,7 +17,7 @@ from datetime import datetime, timedelta
 _NAMES = ("q", "db", "LOCK", "send", "send_kb", "tg", "now", "esc", "log", "OWNER", "CFG", "TOKEN", "TZ",
           "emp", "emp_by_key", "emp_name", "active_employees", "is_workday", "at", "WORK_START", "WORK_END",
           "PENDING", "CSRF", "current_url", "parse_day", "once", "BASE", "DISC_URL", "DISC_SECRET",
-          "BRAND_HEAD", "BRAND_CSS", "brand_nav", "ic", "iconize", "IC_JS", "responsible")
+          "BRAND_HEAD", "BRAND_CSS", "brand_nav", "ic", "iconize", "IC_JS", "responsible", "sees_all")
 
 ONLINE_SEC = 120          # shuncha soniya signal bo'lmasa — oflayn
 CMD_TTL = 600             # oflayn kompyuterga buyruq 10 daqiqa kutadi, keyin bekor bo'ladi
@@ -723,10 +723,12 @@ def company_data(tg_id, day):
     2) boshqa dasturlar (1C, Excel, Word, Telegram, brauzer) — oyna sarlavhasida korxona nomi yoki INN bo'lsa."""
     comps = {r["inn"]: r["name"] or r["inn"] for r in q("SELECT inn, name FROM companies WHERE COALESCE(active,1)=1")}
     out = {}
+    allmine = sees_all(tg_id)          # ZAM / Boshliq — ro'yxatdagi barcha korxonalar uniki
 
     def slot(inn, name=""):
         return out.setdefault(inn, {"inn": inn, "name": comps.get(inn) or name or inn, "listed": inn in comps,
-                                    "mine": responsible(inn, day) == tg_id, "secs": 0, "parts": {}})
+                                    "mine": (allmine and inn in comps) or responsible(inn, day) == tg_id,
+                                    "secs": 0, "parts": {}})
 
     for r in q("SELECT inn, company, page, secs FROM st_company WHERE tg_id=? AND day=?", (tg_id, day)):
         s = slot(r["inn"], r["company"])
@@ -764,7 +766,7 @@ def company_data(tg_id, day):
     now_c = None
     if pr and time.time() - pr[0] < 75:
         now_c = {"inn": pr[1], "name": comps.get(pr[1]) or pr[2] or pr[1], "page": pr[3],
-                 "mine": responsible(pr[1], day) == tg_id}
+                 "mine": (allmine and pr[1] in comps) or responsible(pr[1], day) == tg_id}
     return {"rows": rows, "mine": short(mine), "other": short(other), "now": now_c}
 
 
@@ -1665,7 +1667,7 @@ def corp_now(tg_id):
         return None
     c = q("SELECT name FROM companies WHERE inn=?", (pr[1],), one=True)
     return {"name": (c and c["name"]) or pr[2] or pr[1], "page": pr[3],
-            "mine": responsible(pr[1], now().date().isoformat()) == tg_id}
+            "mine": bool(c and sees_all(tg_id)) or responsible(pr[1], now().date().isoformat()) == tg_id}
 
 
 def live_data():
