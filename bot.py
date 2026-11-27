@@ -252,8 +252,7 @@ def set_role(tg_id, role):
         return False
     old = role_of(tg_id)
     q("UPDATE employees SET role=? WHERE tg_id=?", (role, tg_id))
-    if role == "boshliq" and old != "boshliq":
-        issue_boss_password(tg_id)
+    # Boshliqqa alohida dashboard login-paroli berilmaydi (rahbar kompyuteridan, umumiy login bilan ishlanadi)
     if old == "boshliq" and role != "boshliq":
         q("UPDATE employees SET pw_hash=NULL WHERE tg_id=?", (tg_id,))
         for t in [t for t, who in list(SESS_WHO.items()) if who == tg_id]:
@@ -1520,9 +1519,9 @@ def _handle_message(msg, uid, text, admin):
     if admin and text == "❓ Yordam":
         text = "/help"
     cmd0 = text.split()[0].split("@")[0].lower() if text.startswith("/") else ""
-    if uid != OWNER and admin and cmd0 == "/parol":          # boshliq o'ziga yangi dashboard paroli
-        issue_boss_password(uid)
-        return
+    if cmd0 == "/parol":          # boshliqqa alohida parol berilmaydi
+        q("UPDATE employees SET pw_hash=NULL WHERE tg_id=?", (uid,))
+        return send(uid, "Alohida parol kerak emas — dashboard'ga umumiy login bilan kiriladi.")
     # Boshliq ham hodim: /key, /me, /agent — hodim sifatida javob oladi
     if admin and text.startswith("/") and not (uid != OWNER and cmd0 in ("/key", "/me", "/agent")):
         PENDING.clear()  # yangi buyruq — kutilayotgan kiritish bekor
@@ -1979,8 +1978,8 @@ def role_cell(e, editable):
     opts = "".join(f'<option value="{k}"{" selected" if k == r else ""}>{v}</option>' for k, v in ROLES.items())
     return (f'<form method="post" action="/dashboard/role" class="rolef"><input type="hidden" name="csrf" value="{CSRF}">'
             f'<input type="hidden" name="tg_id" value="{e["tg_id"]}"><select name="role" class="role r-{r}" '
-            f'onchange="if(this.value!==\'boshliq\'||confirm(\'Boshliq: bot xabarlari, bot buyruqlari va dashboard huquqi beriladi. '
-            f'Paroli unga Telegram orqali yuboriladi. Davom etamizmi?\'))this.form.submit();else this.value=\'{r}\'">{opts}</select></form>')
+            f'onchange="if(this.value!==\'boshliq\'||confirm(\'Boshliq: bot xabarlari va bot buyruqlari unga ham ochiladi, '
+            f'davomatdan ozod bo‘ladi. Davom etamizmi?\'))this.form.submit();else this.value=\'{r}\'">{opts}</select></form>')
 
 
 def render_dashboard(flash="", is_owner=True):
@@ -2995,9 +2994,7 @@ class Handler(BaseHTTPRequestHandler):
             if not uid.isdigit() or not set_role(int(uid), role):
                 return self._redirect("no_emp")
             log("ROLE", uid, role)
-            send(OWNER, f"👤 {esc(emp_name(int(uid)))} — rol: <b>{ROLES[role]}</b>"
-                        + (" (dashboard login va paroli unga Telegram'da yuborildi)" if role == "boshliq" else ""),
-                 owner_only=True)
+            send(OWNER, f"👤 {esc(emp_name(int(uid)))} — rol: <b>{ROLES[role]}</b>", owner_only=True)
             return self._redirect("role_ok")
         if path == "/dashboard/add_employee":
             uid, name = f.get("tg_id", "").strip(), " ".join(f.get("name", "").split())[:80]
