@@ -2954,9 +2954,14 @@ class Handler(BaseHTTPRequestHandler):
                 r = st.period_report(kind, day)
                 r.pop("daily", None)
                 return self._out(200, r, extra={"Cache-Control": "no-store"})
-            body, fname = st.report_csv(kind, day, detail=qs.get("t", [""])[0] == "daily")
+            u = qs.get("u", [""])[0]
+            if u.isdigit() and emp(int(u), active_only=False):
+                body, fname = st.report_emp_csv(kind, day, int(u))     # bitta hodim samaradorligi
+            else:
+                body, fname = st.report_csv(kind, day, detail=qs.get("t", [""])[0] == "daily")
+            fname = urllib.parse.quote(fname)
             return self._out(200, body, "text/csv; charset=utf-8",
-                             {"Content-Disposition": f'attachment; filename="{fname}"', "Cache-Control": "no-store"})
+                             {"Content-Disposition": f"attachment; filename*=UTF-8''{fname}", "Cache-Control": "no-store"})
         if path == "/screentime/frame":
             pid, after = qs.get("id", [""])[0], qs.get("after", ["0"])[0]
             if not pid.isdigit():

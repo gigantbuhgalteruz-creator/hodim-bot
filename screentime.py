@@ -390,6 +390,79 @@ def report_csv(kind, day, detail=False):
     return "﻿" + "\r\n".join(lines) + "\r\n", f"screentime-{kind}-{r['from']}{'-kunlik' if detail else ''}.csv"
 
 
+def report_emp_csv(kind, day, tg_id):
+    """Bitta hodim samaradorligi (hafta/oy): umumiy ko'rsatkichlar, kunlik jadval, eng ko'p ishlatilgan
+    dasturlar, saytlar va korxonalar. Excel ochadigan CSV."""
+    a, b, label = period_range(kind, day)
+    name = emp_name(tg_id)
+
+    def line(vals):
+        out = []
+        for v in vals:
+            v = "" if v is None else str(v)
+            out.append('"' + v.replace('"', '""') + '"' if any(c in v for c in ';"\n') else v)
+        return ";".join(out)
+    tot = {"on": 0, "active": 0, "prod": 0, "unprod": 0, "idle": 0, "mine": 0, "other": 0}
+    apps, sites, comps, days, starts, ends = {}, {}, {}, [], [], []
+    d = a
+    while d <= b:
+        ds = d.isoformat()
+        s = day_stats(ds, tg_id).get(tg_id)
+        if s and s.get("on"):
+            cd = company_data(tg_id, ds)
+            mine = sum(r["secs"] for r in cd["rows"] if r["mine"])
+            other = sum(r["secs"] for r in cd["rows"] if not r["mine"])
+            for k in ("on", "active", "prod", "unprod", "idle"):
+                tot[k] += s.get(k, 0)
+            tot["mine"] += mine
+            tot["other"] += other
+            for k, v in s["apps"].items():
+                apps[k] = apps.get(k, 0) + v[0]
+            for r in cd["rows"]:
+                if r["secs"]:
+                    c = comps.setdefault(r["name"], [0, r["mine"]])
+                    c[0] += r["secs"]
+            if s.get("span"):
+                starts.append(s["span"][0])
+                ends.append(s["span"][1])
+            days.append([fmt_day(ds), short(s["on"]), short(s["active"]), short(s["idle"]), short(s["prod"]),
+                         s["eff"] if s["eff"] is not None else "", short(s["unprod"]), short(mine), short(other),
+                         (s.get("span") or ["", ""])[0], (s.get("span") or ["", ""])[1]])
+        for r in q("SELECT domain, SUM(secs) s FROM st_web WHERE tg_id=? AND day=? GROUP BY domain", (tg_id, ds)):
+            sites[r["domain"]] = sites.get(r["domain"], 0) + r["s"]
+        d += timedelta(days=1)
+    eff = round(100 * tot["prod"] / tot["active"]) if tot["active"] >= 600 else ""
+    nd = len(days)
+    L = [line([f"{name} — samaradorlik hisoboti"]), line(["Davr", label]), "",
+         line(["Ko'rsatkich", "Qiymat"]),
+         line(["Ishlagan kunlar", nd]),
+         line(["Kompyuterda jami", short(tot["on"])]),
+         line(["Faol jami", short(tot["active"])]),
+         line(["Kunlik o'rtacha faol", short(tot["active"] // nd) if nd else "0:00"]),
+         line(["Harakatsiz jami", short(tot["idle"])]),
+         line(["Ish dasturlari", short(tot["prod"])]),
+         line(["Ish ulushi %", eff]),
+         line(["Chalg'ish", short(tot["unprod"])]),
+         line(["O'z korxonalariga", short(tot["mine"])]),
+         line(["Boshqa korxonalarga", short(tot["other"])]),
+         line(["O'rtacha boshlash", _hm_avg(starts)]),
+         line(["O'rtacha tugatish", _hm_avg(ends)]), "",
+         line(["KUNLAR BO'YICHA"]),
+         line(["Sana", "Kompyuterda", "Faol", "Harakatsiz", "Ish dasturlari", "Ish ulushi %", "Chalg'ish",
+               "O'z korxonalari", "Boshqa korxonalar", "Boshladi", "Tugatdi"])]
+    L += [line(r) for r in days]
+    L += ["", line(["KORXONALAR", "Vaqt", "Kimniki"])]
+    L += [line([k, short(v[0]), "o'zining" if v[1] else "boshqa hodimniki"])
+          for k, v in sorted(comps.items(), key=lambda kv: -kv[1][0])]
+    L += ["", line(["DASTURLAR", "Vaqt"])]
+    L += [line([k, short(v)]) for k, v in sorted(apps.items(), key=lambda kv: -kv[1])[:30]]
+    if sites:
+        L += ["", line(["SAYTLAR", "Vaqt"])]
+        L += [line([k, short(v)]) for k, v in sorted(sites.items(), key=lambda kv: -kv[1])[:40]]
+    safe = re.sub(r"[^\w-]+", "_", name, flags=re.U).strip("_")[:40] or str(tg_id)
+    return "﻿" + "\r\n".join(L) + "\r\n", f"samaradorlik-{safe}-{kind}-{a.isoformat()}.csv"
+
+
 WB_COL = {"mine": "#F28322", "work": "#22c55e", "neutral": "#60a5fa", "distract": "#ef4444", "idle": "#d6d3d1"}
 WB_NAME = {"mine": "Bizning korxonalar", "work": "Boshqa ish", "neutral": "Boshqa", "distract": "Chalg‘ish",
            "idle": "Harakatsiz"}
@@ -1343,6 +1416,7 @@ padding:3px 9px;border-radius:999px;background:rgba(20,18,24,.72);color:#fff;fon
 .stbox{padding:18px 20px}.sthead{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:12px}
 .stexp{margin-left:auto;display:flex;gap:8px}
 .sttab td,.sttab th{padding:11px 12px;white-space:nowrap}.sttab td .ibtn{width:30px;height:30px}
+.sttab td.ra{display:flex;gap:6px;justify-content:flex-end}
 .tabs2{display:inline-flex;gap:4px;padding:4px;border-radius:12px;background:var(--line)}
 .tabs2 button{font:inherit;font-size:14px;font-weight:500;border:0;background:none;color:var(--mut);padding:6px 16px;border-radius:9px;cursor:pointer;transition:background .2s,color .2s}
 .tabs2 button.on{background:var(--solid);color:var(--ink);box-shadow:0 1px 3px rgba(0,0,0,.08)}
@@ -1758,7 +1832,8 @@ async function loadSt(){$('#stCsv').href='/screentime/report.csv?p='+ST.k+'&d='+
   <td>${x.eff==null?'—':`<span class="pill ${x.eff>=70?'g':x.eff>=45?'y':'r'}">${x.eff}%</span>`}</td>
   <td style="color:var(--r)">${hm(x.unprod)}</td><td style="color:var(--g)">${hm(x.mine)}</td><td>${hm(x.other)}</td>
   <td class="sub">${x.start?x.start+' · '+x.end:'—'}</td>
-  <td><a class="ibtn" href="/screentime/hodim?u=${x.tg}&d=${j.to}" title="Batafsil">${IC.chart}</a></td></tr>`).join('')
+  <td class="ra"><a class="ibtn" href="/screentime/report.csv?p=${ST.k}&d=${ST.d}&u=${x.tg}" title="Samaradorlik hisobotini yuklab olish (Excel)">${IC.download}</a>
+  <a class="ibtn" href="/screentime/hodim?u=${x.tg}&d=${j.to}" title="Batafsil">${IC.chart}</a></td></tr>`).join('')
    ||'<tr><td colspan="10" class="sub">Bu davrda ma’lumot yo‘q</td></tr>'}catch(e){$('#stBody').innerHTML='<tr><td colspan="10" class="sub">Yuklab bo‘lmadi</td></tr>'}}
 $$('#stTabs button').forEach(b=>b.onclick=()=>{ST.k=b.dataset.k;$$('#stTabs button').forEach(x=>x.classList.toggle('on',x===b));loadSt()});
 $('#stPrev').onclick=e=>{e.preventDefault();ST.d=shiftD(-1);loadSt()};
