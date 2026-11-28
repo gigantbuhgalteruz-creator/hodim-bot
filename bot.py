@@ -868,14 +868,15 @@ def name_key(s):
 
 
 # Soliq turining o'z chastotasi (korxona sozlamasidan ustun): foyda — chorakda (3,6,9,12-oy);
-# balans, moliyaviy natija, statistika — yilda bir marta (12-oy davri). Qolganlari — korxona majburiyatiga qarab.
-TAX_FREQ = {"prib": "q", "balans": "y", "finres": "y", "stat": "y"}
+# balans, moliyaviy natija — yilda bir marta (12-oy davri). Qolganlari — korxona majburiyatiga qarab.
+# statistika ("ym"): yillik — 12-oy davri (topshirilmasa alert); oylik — qo'lda to'ldiriladi, alert yo'q (katak bo'sh).
+TAX_FREQ = {"prib": "q", "balans": "y", "finres": "y", "stat": "ym"}
 
 
 def tax_due_month(tax, month, freq):
-    """Shu oy (davr) uchun bu hisobot topshiriladimi."""
+    """Shu oy (davr) uchun bu hisobot talab qilinadimi (topshirilmasa "topshirilmagan" chiqadi)."""
     f = TAX_FREQ.get(tax, freq)
-    return month == 12 if f == "y" else (month % 3 == 0 if f == "q" else True)
+    return month == 12 if f in ("y", "ym") else (month % 3 == 0 if f == "q" else True)
 
 
 def tax_due(per, tax=None):
@@ -3179,6 +3180,9 @@ def cell_view(cell):
         info = "Hali topshirilmagan, muddat o'tmagan."
     if st == "note":
         text = cell.get("detail") or ""
+    elif st is None and cell.get("off") and cell.get("freq") == "ym":   # oylik statistika — qo'lda, alertsiz
+        text = ""
+        info = "Oylik statistika — qo'lda to'ldiriladi (eslatma yo'q). Yillik — dekabr davrida talab qilinadi"
     elif st is None and cell.get("off"):      # topshiradi, lekin bu oyda emas (choraklik / yillik)
         text = "—"
         info = ("Yillik hisobot — faqat dekabr davri uchun (yilda bir marta) topshiriladi"
