@@ -2145,13 +2145,15 @@ def render_page(day, flash=""):
     no_agent = [e["name"] for e in active_employees() if e["tg_id"] not in with_pc]
     pcs_html = (f'<div class="wall" id="tiles"></div>'
                 f'<div class="acts" style="margin-top:14px">{btn("all", "block", "⛔ Hammasini bloklash", "ghost", "HAMMA onlayn kompyuterlar bloklansinmi?")}'
-                f'{btn("all", "unblock", "🔓 Hammasini ochish")}</div>'
+                f'{btn("all", "unblock", "🔓 Hammasini ochish")}'
+                f'<button type="button" class="btn sm ghost" id="bMsgAll">{ic("message")}Xabar yuborish</button></div>'
                 if allpcs else '<div class="glass" style="padding:20px">Hali agent o‘rnatilmagan. '
                                'Telegram botga <b>/agent</b> yozing — o‘rnatish yo‘riqnomasi keladi.</div>')
     if allpcs and no_agent:
         pcs_html += (f'<p class="sub" style="margin:10px 4px 0">Agent o‘rnatilmagan: {esc(", ".join(no_agent))} '
                      f'(Telegram botda /agent)</p>')
     init = json.dumps(live_data(), ensure_ascii=False).replace("<", "\\u003c")
+    noagent_js = json.dumps(no_agent, ensure_ascii=False).replace("<", "\\u003c")
 
     cards = []
     order = sorted(active_employees(), key=lambda e: -(st.get(e["tg_id"], {}).get("active", 0)))
@@ -2265,7 +2267,20 @@ def render_page(day, flash=""):
 <div id="dList" class="dlist"></div>
 <p class="sub">Qatorni bosing — ichida nima ochilgani ko‘rinadi va uni <b>ish</b>, <b>boshqa</b> yoki <b>chalg‘ish</b> deb belgilash mumkin
 (belgi hamma hodimlarga va o‘tgan kunlarga ham qo‘llanadi).</p></div></dialog>
-<script>const CSRF="{CSRF}",DAY="{day}",TODAY="{today.isoformat()}",IC={IC_JS};let DATA={init};{LIVE_JS}</script>{refresh}</body></html>"""
+<dialog id="dMsg" style="max-width:520px"><div class="mh"><div><h3>{ic("message")}Hodimlarga xabar</h3>
+<div class="sub">Xabar tanlangan hodimlarning kompyuter ekranida oyna bo‘lib chiqadi</div></div>
+<button type="button" class="x" data-close aria-label="Yopish">×</button></div>
+<textarea id="xText" maxlength="500" rows="4" placeholder="Xabar matni, masalan: 17:00 da yig‘ilish bor"
+ style="width:100%;box-sizing:border-box;padding:10px 12px;border-radius:12px;border:1px solid var(--line,#ddd);font:inherit;resize:vertical;background:rgba(255,255,255,.85)"></textarea>
+<div class="xmode" style="display:flex;gap:18px;margin:12px 2px 6px">
+<label><input type="radio" name="xMode" value="all" checked> Barcha hodimlar</label>
+<label><input type="radio" name="xMode" value="sel"> Tanlanganlar</label></div>
+<div id="xPick" hidden><label style="display:block;padding:6px 2px;border-bottom:1px solid var(--line,#eee)"><input type="checkbox" id="xAll"> <b>Hammasini belgilash</b></label>
+<div id="xList" style="max-height:260px;overflow:auto;padding:4px 2px"></div></div>
+<div id="xRes" class="sub" style="margin:10px 2px 0;line-height:1.5" hidden></div>
+<div class="acts mt" style="justify-content:flex-end"><button type="button" class="btn sm ghost" data-close>Yopish</button>
+<button type="button" class="btn sm" id="xSend">{ic("message")}Yuborish</button></div></dialog>
+<script>const CSRF="{CSRF}",DAY="{day}",TODAY="{today.isoformat()}",IC={IC_JS},NOAGENT={noagent_js};let DATA={init};{LIVE_JS}</script>{refresh}</body></html>"""
 
 
 def corp_now(tg_id):
@@ -2366,6 +2381,35 @@ def do_cmd(f):
     return ("shot_ok" if cmd == "shot" else "cmd_ok"), done.get(cmd, f"{CMD_LABEL.get(cmd, cmd)} — yuborildi")
 
 
+def msg_many(f):
+    """Bir nechta (yoki hamma) kompyuterga ekranda pop-up xabar. Bitta hodimdagidek: onlayn — darhol,
+    oflayn — navbatda CMD_TTL (10 daqiqa) kutadi, keyin bekor bo'ladi."""
+    text = (f.get("arg") or "").strip()[:500]
+    if not text:
+        return {"ok": False, "text": "Xabar matni bo‘sh"}
+    allp = pcs()
+    if f.get("pcs") == "all":
+        sel = allp
+    else:
+        ids = {int(x) for x in (f.get("pcs") or "").split(",") if x.strip().isdigit()}
+        sel = [r for r in allp if r["id"] in ids]
+    if not sel:
+        return {"ok": False, "text": "Hech kim tanlanmagan"}
+    on, off = [], []
+    for r in sel:
+        queue_cmd(r["id"], "msg", text, notify=0)
+        (on if pc_online(r) else off).append(r["ename"] or r["pc"] or "?")
+    with_pc = {r["tg_id"] for r in allp}
+    sel_tg = {r["tg_id"] for r in sel}
+    no_agent = ([e["name"] for e in active_employees() if e["tg_id"] not in with_pc]
+                if f.get("pcs") == "all" else [])
+    log("DASHBOARD MSG", len(sel), "pc", len(sel_tg), "hodim")
+    t = f"💬 {len(on)} ta kompyuterga yetkazildi" if on else "💬 Hech qaysi tanlangan kompyuter hozir onlayn emas"
+    if off:
+        t += f"; {len(off)} tasi oflayn — 10 daqiqa ichida yoqilsa chiqadi"
+    return {"ok": True, "text": t, "online": on, "offline": off, "no_agent": no_agent}
+
+
 def dashboard_post(f):
     """POST /dashboard/pc — redirect manzilini qaytaradi."""
     day = f.get("d", "")
@@ -2380,6 +2424,8 @@ def dashboard_json(f):
         ok = set_rule(f.get("arg", ""), f.get("cat", ""))
         log("DASHBOARD ST RULE", f.get("arg", "")[:60], f.get("cat", ""))
         return {"ok": ok, "text": "Saqlandi — hisob qayta hisoblandi" if ok else "Noto‘g‘ri"}
+    if f.get("cmd") == "msg" and "pcs" in f:
+        return msg_many(f)
     code, text = do_cmd(f)
     return {"ok": code in ("cmd_ok", "shot_ok"), "text": text}
 
@@ -2542,8 +2588,38 @@ $('#mBlock').onclick=()=>{const p=DATA.find(x=>x.id===cur);if(!p)return;
  if(p.blocked)send('unblock');else send('block',$('#mMsg').value.trim())};
 $$('#dPc [data-cmd]').forEach(b=>b.onclick=()=>{const c=b.dataset.cmd;
  if(b.dataset.ask&&!confirm(b.dataset.ask))return;
- if(c==='msg'){const t=prompt('Hodim ekranida chiqadigan xabar:');if(t&&t.trim())send('msg',t.trim());return}
+ if(c==='msg'){openMsg(cur);return}
  send(c)});
+// ---- Xabar: bitta, bir nechta yoki barcha hodimlar ekraniga pop-up ----
+const xd=$('#dMsg');
+function xMode(){return (document.querySelector('input[name=xMode]:checked')||{}).value||'all'}
+function xSync(){const sel=xMode()==='sel';$('#xPick').hidden=!sel;const bs=$$('#xList input:not(:disabled)'),n=bs.filter(b=>b.checked).length;
+ $('#xAll').checked=bs.length>0&&n===bs.length;$('#xAll').indeterminate=n>0&&n<bs.length;
+ $('#xSend').innerHTML=IC.message+(sel?'Yuborish ('+n+')':'Hammaga yuborish ('+DATA.length+')')}
+function openMsg(pre){const keep={};$$('#xList input').forEach(b=>keep[b.value]=b.checked);
+ $('#xList').innerHTML=DATA.map(p=>`<label style="display:flex;align-items:center;gap:8px;padding:5px 0"><input type="checkbox" value="${p.id}">
+  <span style="flex:1">${E(p.name)} <span class="sub">${E(p.pc)}</span></span><span class="sub" style="color:${p.online?'var(--g)':'var(--mut,#999)'}">${p.online?'onlayn':'oflayn'}</span></label>`).join('')
+  +NOAGENT.map(n=>`<label style="display:flex;gap:8px;padding:5px 0;opacity:.55"><input type="checkbox" disabled><span style="flex:1">${E(n)}</span><span class="sub">agent yo‘q</span></label>`).join('');
+ $$('#xList input:not(:disabled)').forEach(b=>{b.checked=pre!=null?+b.value===pre:!!keep[b.value];b.onchange=xSync});
+ document.querySelector('input[name=xMode][value='+(pre!=null?'sel':'all')+']').checked=true;
+ $('#xRes').hidden=true;$('#xSend').disabled=false;xSync();xd.showModal();$('#xText').focus()}
+$$('input[name=xMode]').forEach(r=>r.onchange=xSync);
+$('#xAll').onchange=e=>{$$('#xList input:not(:disabled)').forEach(b=>b.checked=e.target.checked);xSync()};
+{const b=$('#bMsgAll');if(b)b.onclick=()=>openMsg(null)}
+$('#xSend').onclick=async()=>{const t=$('#xText').value.trim(),res=$('#xRes');res.hidden=false;
+ if(!t){res.textContent='Xabar matnini yozing';$('#xText').focus();return}
+ const ids=xMode()==='all'?'all':$$('#xList input:checked:not(:disabled)').map(b=>b.value).join(',');
+ if(!ids){res.textContent='Kamida bitta hodimni belgilang';return}
+ const b=$('#xSend');b.disabled=true;res.textContent='Yuborilmoqda…';
+ try{const r=await fetch('/dashboard/pc',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/x-www-form-urlencoded'},
+   body:new URLSearchParams({csrf:CSRF,cmd:'msg',pcs:ids,arg:t,ajax:'1'})});const j=await r.json();
+  if(!j.ok){res.textContent=j.text||j.error||'Xato';b.disabled=false;return}
+  let h='<b style="color:var(--g)">'+E(j.text)+'</b>';
+  if(j.online.length)h+='<br>✅ Yetkazildi: '+E(j.online.join(', '));
+  if(j.offline.length)h+='<br>⏳ Oflayn (10 daqiqa navbatda): '+E(j.offline.join(', '));
+  if(j.no_agent&&j.no_agent.length)h+='<br>⚠️ Agent yo‘q, yuborilmadi: '+E(j.no_agent.join(', '));
+  res.innerHTML=h;$('#xText').value='';setTimeout(()=>{b.disabled=false},1500)}
+ catch(e){res.textContent='Yuborilmadi — sahifani yangilang (F5)';b.disabled=false}};
 $$('[data-close]').forEach(b=>b.onclick=()=>b.closest('dialog').close());
 dlg.addEventListener('close',()=>{cur=null;LV++;clearTimeout(dTimer);poll()});
 draw();timer=setTimeout(poll,4000);
