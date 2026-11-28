@@ -6,6 +6,7 @@ Nima qiladi:
   * brauzerda manzil satridan joriy sayt havolasini o'qiydi (UI Automation);
   * har 10 soniyada natijani hodim bot serveriga yuboradi (internet bo'lmasa — keyin yuboradi);
   * serverdan buyruq olsa bajaradi: bloklash, o'chirish, qayta yoqish, chiqish, xabar, skrinshot;
+  * ekran yozuvi: har 10 soniyada kichik kadr (kuzatuv kamerasi kabi; server 2 kundan keyin o'chiradi);
   * "kompyuter klub" bloki: butun ekranni yopadigan oyna (rahbar ochmaguncha ishlab bo'lmaydi);
   * buyruqlarni darhol olish uchun serverda doimiy "kutish" so'rovi (long-poll) ushlab turadi.
 
@@ -27,11 +28,12 @@ import urllib.error
 import urllib.request
 import zlib
 
-VERSION = "1.8"
+VERSION = "1.9"
 STABLE_URL = "https://gigantbuxgalter.com"   # doimiy server manzili (Cloudflare tunnel, o'zgarmaydi)
 SAMPLE_SEC = 5          # necha soniyada bir tekshiriladi
 FLUSH_SEC = 10          # necha soniyada serverga yuboriladi (jonli jurnal uchun tez)
 IDLE_LIMIT = 180        # shuncha soniya klaviatura/sichqoncha tegilmasa — "harakatsiz"
+REC_SEC = 10            # ekran yozuvi: necha soniyada bir kadr (server o'zgartirishi mumkin)
 MAX_PENDING = 6000      # internet yo'q paytda saqlanadigan yozuvlar chegarasi (~2-3 kun)
 
 PROGRAMDATA = os.environ.get("PROGRAMDATA", r"C:\ProgramData")
@@ -1027,6 +1029,42 @@ def main():
         finally:
             shared["live"] = False
             log("Jonli ekran to'xtadi")
+
+    def rec_loop():
+        """Ekran yozuvi (kuzatuv kamerasi kabi): har REC_SEC soniyada kichik JPEG kadr serverga.
+        Ekran qulflangan / bloklangan paytda yozilmaydi; hodim harakatsiz bo'lsa — siyrakroq.
+        Server javobi: {"rec": bool, "interval", "idle_interval", "w", "q"}; o'chirilgan bo'lsa 5 daqiqada qayta so'raladi."""
+        from urllib.parse import quote
+        iv, wmax, qual, idle_iv = REC_SEC, 960, 45, 60
+        nxt = 0.0
+        while True:
+            time.sleep(1)
+            try:
+                if time.time() < nxt or screen_locked() or blocker.on:
+                    continue
+                idle = idle_seconds()
+                t = time.time()
+                nxt = t + (idle_iv if idle >= IDLE_LIMIT else iv)
+                jpg = screenshot_jpeg(wmax, qual)
+                req = urllib.request.Request(client.base + "/api/rec", data=jpg, method="POST", headers={
+                    "Content-Type": "image/jpeg", "X-Key": conf["key"], "X-Pc": quote(pc), "X-User": quote(user),
+                    "X-Ts": str(int(t)), "User-Agent": f"GigantAgent/{VERSION}"})
+                with urllib.request.urlopen(req, timeout=20) as r:
+                    res = json.loads(r.read() or b"{}")
+                if not res.get("rec"):
+                    nxt = time.time() + 300           # yozuv o'chirilgan — 5 daqiqadan keyin qayta so'raymiz
+                    continue
+                iv = max(3, min(int(res.get("interval", iv)), 120))
+                idle_iv = max(iv, min(int(res.get("idle_interval", idle_iv)), 600))
+                wmax = max(480, min(int(res.get("w", wmax)), 1600))
+                qual = max(20, min(int(res.get("q", qual)), 80))
+            except urllib.error.HTTPError as e:
+                nxt = time.time() + (300 if e.code == 404 else 20)
+            except Exception:
+                nxt = time.time() + 20                # internet yo'q — kadr o'tkazib yuboriladi
+
+    if gdip:
+        threading.Thread(target=rec_loop, daemon=True).start()
 
     def take_done():
         with shared["lock"]:

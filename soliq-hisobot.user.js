@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Soliq.uz → Hodim bot: hisobotlar
 // @namespace    soliq-telegram
-// @version      5.1
+// @version      5.4
 // @description  Hodim soliq.uz kabinetida ishlayotganda hisobotlar jurnalini fonda tekshiradi va yangi/o'zgargan hisobotlarni bot serveriga yuboradi (bot ularni faqat ownerga jo'natadi).
 // @match        *://*/*
 // @grant        GM_xmlhttpRequest
@@ -174,27 +174,46 @@
   // ====== Korxona reytingi ("Рейтинг: C - 34") — topilsa serverga yuboriladi, jadvaldagi "Рейтинг" ustuniga tushadi ======
   const sentRating = {};
   const LAT = { 'А': 'A', 'В': 'B', 'С': 'C', 'Д': 'D', 'Е': 'E', 'Б': 'B' };
+  // "Рейтинг: C - 34", "Рейтинг: CC - 37", "Рейтинги: ВВВ-80", "Reytingi: C 34" (ru / uz-kirill / uz-lotin; 1–3 harf)
+  const RATING_RE = /(?:Рейтинг|Reyting)[а-яёўқғҳa-zʼ'`]*\s*:?\s*([A-EАБВСДЕ]{1,3})\s*[-–—:]?\s*(\d{1,3})(?!\d)/i;
   function findRatings() {
     const found = {};
     document.querySelectorAll('body *').forEach(el => {
-      if (el.children.length > 3) return;
-      const m = (el.textContent || '').match(/(?:Рейтинг|Reyting)\s*:?\s*([A-EАБВСДЕ])\s*[-–—]?\s*(\d{1,3})/i);
-      if (!m || el.textContent.length > 80) return;
+      if (el.children.length > 6) return;
+      const t = clean(el.textContent);
+      const m = t.match(RATING_RE);
+      if (!m || t.length > 160) return;
       let up = el;                                   // yaqin ota elementdan korxona STIR/INN ini topamiz
       for (let i = 0; i < 7 && up; i++, up = up.parentElement) {
         const inn = ((up.textContent || '').match(/(?:СТИР|STIR|ИНН|INN)\s*:?\s*(\d{9})/i) || [])[1]
                     || (up !== el && onNew ? ((up.textContent || '').match(/\b(\d{9})\b/) || [])[1] : null);
-        if (inn) { found[inn] = (LAT[m[1].toUpperCase()] || m[1].toUpperCase()) + ' - ' + m[2]; break; }
+        if (inn) { found[inn] = [...m[1].toUpperCase()].map(ch => LAT[ch] || ch).join('') + ' - ' + m[2]; break; }
       }
     });
     return found;
   }
-  let ratingDiag = 'hali tekshirilmadi';
-  function ratingTick() {
+  let ratingDiag = 'hali tekshirilmadi', probed = false;
+  // Topilmasa — sahifadagi "рейтинг" so'zi bor qisqa yozuvlarni (faqat shularni) serverga bir marta yuboramiz,
+  // shunda yozuv shaklini ko'rib, qidiruvni to'g'rilash mumkin bo'ladi.
+  function probeRatingText(force) {
+    if (probed && !force) return;
+    const seen = new Set();
+    document.querySelectorAll('body *').forEach(el => {
+      if (seen.size >= 6 || el.children.length > 6) return;
+      const t = clean(el.textContent);
+      if (t.length <= 200 && /рейтинг|reyting/i.test(t)) seen.add(t);
+    });
+    if (!seen.size && !force) return;
+    probed = true;
+    post('/api/rating', { probe: { where: 'text', url: location.pathname, samples: [...seen].join(' || ') } }).catch(() => {});
+  }
+  function ratingTick(manual) {
     if (!KEY) { ratingDiag = 'kalit kiritilmagan'; return; }
     const found = findRatings();
     ratingDiag = Object.keys(found).length ? 'topildi: ' + Object.entries(found).map(([i, r]) => i + ' → ' + r).join(', ')
-                                           : 'sahifada "Рейтинг" yozuvi topilmadi';
+               : !onNew ? 'bu sahifada reyting yo\'q. Reyting my.soliq.uz da (tepada "Рейтинг: …") chiqadi — o\'sha sahifani oching'
+               : 'sahifada "Рейтинг" yozuvi topilmadi (shu sahifa serverga ko\'rsatildi)';
+    if (!Object.keys(found).length && onNew) probeRatingText(manual === true);
     for (const [inn, rating] of Object.entries(found)) {
       if (sentRating[inn] === rating) continue;
       sentRating[inn] = rating;
@@ -204,7 +223,7 @@
     }
   }
   GM_registerMenuCommand('⭐ Reytingni tekshirish', () => {
-    ratingTick();
+    ratingTick(true);
     setTimeout(() => alert(`Skript: v${GM_info.script.version}\nServer: ${serverUrl}\nReyting: ${ratingDiag}`), 1500);
   });
   setTimeout(ratingTick, 3000);

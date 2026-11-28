@@ -22,6 +22,7 @@ import urllib.request
 from datetime import date, datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import i18n  # dashboard tillari: uz / ru / en
 import screentime as st  # hodim kompyuterlari: screen time + boshqaruv (screentime.py)
 
 import sys
@@ -142,7 +143,7 @@ CREATE TABLE IF NOT EXISTS obligations(
 """)
 for _col, _typ in (("activity", "TEXT"), ("staff", "TEXT"), ("c1", "TEXT"), ("note", "TEXT"),
                    ("regime", "TEXT"), ("perk", "TEXT"), ("rating", "TEXT"), ("rating_ts", "TEXT"),
-                   ("sort", "INTEGER"), ("active", "INTEGER DEFAULT 1")):
+                   ("sort", "INTEGER"), ("active", "INTEGER DEFAULT 1"), ("aliases", "TEXT")):
     if _col not in {r[1] for r in db.execute("PRAGMA table_info(companies)")}:
         db.execute(f"ALTER TABLE companies ADD COLUMN {_col} {_typ}")
 for _col, _typ in (("role", "TEXT DEFAULT 'hodim'"), ("pw_hash", "TEXT"),      # rollar (hodim / bosh / zam / boshliq)
@@ -160,6 +161,20 @@ if not db.execute("SELECT 1 FROM meta WHERE k='manual_list_v1'").fetchone():
     db.execute("INSERT INTO meta(k,v) VALUES('manual_list_v1', datetime('now'))")
     db.commit()
 LISTED = "COALESCE(active,1)=1"   # SQL sharti: korxona bizning ro'yxatda
+# Reyting tarixi: har o'zgarish (soliq.uz skriptidan yoki qo'lda) — oylar bo'yicha dinamika grafigi uchun
+db.executescript("""
+CREATE TABLE IF NOT EXISTS rating_hist(id INTEGER PRIMARY KEY AUTOINCREMENT, inn TEXT, ts TEXT, rating TEXT,
+  num INTEGER, src TEXT);
+CREATE INDEX IF NOT EXISTS ix_rh_inn ON rating_hist(inn, ts);
+""")
+if not db.execute("SELECT 1 FROM meta WHERE k='rating_hist_v1'").fetchone():   # bir martalik: hozirgi reytinglar
+    for _r in db.execute("SELECT inn, rating, rating_ts FROM companies WHERE COALESCE(rating,'')!=''").fetchall():
+        _m = re.search(r"(\d{1,3})", _r["rating"])
+        db.execute("INSERT INTO rating_hist(inn,ts,rating,num,src) VALUES(?,?,?,?,'soliq')",
+                   (_r["inn"], (_r["rating_ts"] or datetime.now().isoformat())[:19], _r["rating"],
+                    min(100, int(_m.group(1))) if _m else None))
+    db.execute("INSERT INTO meta(k,v) VALUES('rating_hist_v1', datetime('now'))")
+    db.commit()
 
 
 def q(sql, args=(), one=False):
@@ -553,38 +568,69 @@ def week_range(d=None):
     return a, a + timedelta(days=6)
 
 
+def eff_dot(v):
+    return "⚪" if v is None else ("🟢" if v >= 90 else "🟡" if v >= 70 else "🔴")
+
+
 def summary_text(title, a, b):
-    lines = [f"📊 <b>{title}</b> ({a:%d.%m}–{b:%d.%m})", ""]
-    for s in stats(a, b):
-        eff = "—" if s["eff"] is None else f"{s['eff']}%"
-        lines.append(f"👷 <b>{esc(s['e']['name'])}</b> — samaradorlik <b>{eff}</b>")
-        lines.append(f"   ✅ {s['on_time']}  ⏰ {s['late']} ({s['late_minutes']} daq)  ❌ {s['absent']}"
-                     f"  📄 hisobot: {s['reports']}")
+    """Hafta/oy davomati: har hodim alohida blok, eng yaxshisi tepada."""
+    rows = stats(a, b)
+    rows.sort(key=lambda s: (s["eff"] is None, -(s["eff"] or 0), s["e"]["name"]))
+    lines = [f"📊 <b>{title}</b>", f"🗓 {a:%d.%m} – {b:%d.%m.%Y}"]
+    effs = [s["eff"] for s in rows if s["eff"] is not None]
+    if effs:
+        lines.append(f"O'rtacha samaradorlik: <b>{round(sum(effs) / len(effs))}%</b>")
+    for s in rows:
+        e = s["e"]
+        lines.append("")
+        if e["role"] == "boshliq":
+            lines.append(f"⚪ <b>{esc(e['name'])}</b> — davomatdan ozod")
+            continue
+        lines.append(f"{eff_dot(s['eff'])} <b>{esc(e['name'])}</b> — {_pct(s['eff'])}")
+        parts = [f"✅ {s['on_time']} vaqtida"]
+        if s["late"]:
+            parts.append(f"⏰ {s['late']} kech ({s['late_minutes']} daq)")
+        if s["absent"]:
+            parts.append(f"❌ {s['absent']} kelmadi")
+        lines.append("      " + " · ".join(parts))
+        if s["reports"]:
+            lines.append(f"      📄 {s['reports']} ta hisobot")
         if s["viol"]:
-            lines.append(f"   ⚠️ Oy bo'yicha qoidabuzarlik: {s['viol']} | jarima {s['fine_pct']}%"
-                         + (f" = {money(s['fine_sum'])}" if s["e"]["salary"] else ""))
-    if len(lines) == 2:
-        lines.append("Hodimlar yo'q. /add bilan qo'shing.")
+            lines.append(f"      ⚠️ Oyda {s['viol']} qoidabuzarlik · jarima {s['fine_pct']}%"
+                         + (f" = {money(s['fine_sum'])}" if e["salary"] else ""))
+    if not rows:
+        lines += ["", "Hodimlar yo'q. /add bilan qo'shing."]
     return "\n".join(lines)
 
 
 def morning_text():
+    """Bugungi davomat: har guruh alohida sarlavha bilan, har hodim alohida qatorda."""
     d = now().date()
-    came, late, missing = [], [], []
+    started = now() >= at(d, WORK_START)
+    came, late, absent, missing = [], [], [], []
     for e in active_employees():
         if e["role"] == "boshliq":
             continue
         r = q("SELECT * FROM checkins WHERE tg_id=? AND day=?", (e["tg_id"], d.isoformat()), one=True)
+        name = esc(e["name"])
         if not r:
-            missing.append(e["name"])
+            missing.append(f"• {name}")
         elif r["status"] == "on_time":
-            came.append(f"{e['name']} ({r['ts'][11:16]})")
+            came.append(f"• {name} — {r['ts'][11:16]}")
+        elif r["status"] == "late":
+            late.append(f"• {name} — {r['ts'][11:16]} <i>({r['minutes_late']} daq kech)</i>")
         else:
-            late.append(f"{e['name']} ({r['ts'][11:16]})")
-    return (f"🌅 <b>{d:%d.%m.%Y} davomat ({WORK_START})</b>\n"
-            f"✅ Vaqtida: {esc(', '.join(came)) or '—'}\n"
-            f"⏰ Kech: {esc(', '.join(late)) or '—'}\n"
-            f"❓ Hali kelmagan: {esc(', '.join(missing)) or '—'}")
+            absent.append(f"• {name}")
+    total = len(came) + len(late) + len(absent) + len(missing)
+    lines = [f"📅 <b>Davomat · {d:%d.%m.%Y}</b>", f"Ish boshlanishi: {WORK_START} · Jami: {total} hodim"]
+    if not is_workday(d):
+        lines.append("🏖 Bugun dam olish kuni")
+    for icon, title, items in (("✅", "Vaqtida keldi", came), ("⏰", "Kech qoldi", late),
+                               ("❌", "Kelmadi (video yubormadi)", absent),
+                               ("⏳", "Hali kelmagan" if started else "Hali video yubormagan", missing)):
+        if items:
+            lines += ["", f"{icon} <b>{title} — {len(items)}</b>"] + items
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------- reports from soliq.uz
@@ -630,6 +676,14 @@ def handle_report(e, body):
     if not c or c["active"] == 0:
         # Bizning ro'yxatda yo'q (yoki karzinadagi) korxona — hodim kabinetidagi boshqa firma.
         # Hisobot saqlanadi (keyin ro'yxatga qo'shilsa jadvalga tushadi), lekin xabar yuborilmaydi.
+        # Sinov (Tampermonkey menyusidan) — jim qolmaymiz: nega xabar kelmasligini aytamiz.
+        if "(sinov)" in status:
+            why = "karzinada" if c else "korxonalar ro'yxatida yo'q"
+            send(OWNER, f"🧪 <b>Sinov hisoboti serverga yetib keldi</b>\n"
+                        f"{esc(company or inn)}\n<code>{esc(inn)}</code>\n\n"
+                        f"👷 Yuborgan: {esc(e['name'])}\n\n"
+                        f"⚠️ Bu korxona {why}, shuning uchun uning hisobotlari haqida xabar kelmaydi.\n"
+                        f"Qo'shish: {current_url()}/hisobotlar → “+ Mijoz”")
         return 200, {"ok": True, "ignored": True}
     if company and not c["name"]:
         q("UPDATE companies SET name=? WHERE inn=?", (company, inn))
@@ -650,36 +704,43 @@ def handle_report(e, body):
         note = ""
 
     level, label = status_level(status, rec.get("Причина ошибки"))
-    title = "🔄 Hisobot holati o'zgardi" if is_update else "🧾 Yangi hisobot"
+    dot = {"good": "🟢", "bad": "🔴"}.get(level, "🟡")
+    what = "Hisobot holati o'zgardi" if is_update else "Yangi hisobot"
+    g = lambda k: esc(str(rec.get(k) or "").strip())
+    cname = esc(company or (c["name"] if c else "") or inn)
     if level == "bad":
-        lines = ["🚨🚨🚨 <b>DIQQAT! " + esc(label.upper()) + "</b> 🚨🚨🚨",
-                 f"🔴 <b>{title}</b>", f"<b>{esc(company)}</b>", ""]
-    elif level == "good":
-        lines = [f"🟢 <b>{title} — {esc(label)}</b>", f"<b>{esc(company)}</b>", ""]
+        lines = [f"🚨 <b>DIQQAT: {esc(label.upper())}</b>", f"{cname}"]
     else:
-        lines = [f"🟡 <b>{title} — {esc(label)}</b>", f"<b>{esc(company)}</b>", ""]
-    for k, v in rec.items():
-        if v:
-            if k == "Состояние":
-                dot = {"good": "🟢", "bad": "🔴"}.get(level, "🟡")
-                lines.append(f"{dot} <b>{esc(str(k))}:</b> <b>{esc(str(v))}</b>")
-            else:
-                lines.append(f"{ICONS.get(k, '•')} <b>{esc(str(k))}:</b> {esc(str(v))}")
-    if level == "bad":
-        lines += ["", "❗️ <b>Zudlik bilan tekshiring!</b>"]
-    lines += ["", "━━━━━━━━━━━━━━━",
-              f"🏢 <b>Kabinet:</b> {esc(company or '—')}",
-              f"🔢 <b>ИНН:</b> <code>{esc(inn)}</code>"]
-    if c and c["rating"]:
-        lines.append(f"⭐ <b>Reyting:</b> {esc(c['rating'])}")
+        lines = [f"{dot} <b>{what} · {esc(label)}</b>", f"{cname}"]
+    lines.append(f"<code>{esc(inn)}</code>" + (f" · ⭐ {esc(c['rating'])}" if c and c["rating"] else ""))
+    # Asosiy ma'lumot — qisqa, har biri alohida qatorda
+    lines.append("")
+    if g("Наименование"):
+        lines.append(f"📄 <b>{g('Наименование')}</b>")
+    per = " ".join(x for x in (g("Период"), g("Год")) if x)
+    if per:
+        lines.append(f"🗓 Davr: {per}")
+    lines.append(f"{dot} Holat: <b>{g('Состояние') or esc(label)}</b>")
+    if g("Причина ошибки"):
+        lines.append(f"⚠️ Sabab: <b>{g('Причина ошибки')}</b>")
+    if g("Дата отправки"):
+        lines.append(f"📤 Yuborilgan: {g('Дата отправки')}")
+    if g("Дата проверки"):
+        lines.append(f"🔎 Tekshirilgan: {g('Дата проверки')}")
+    if g("№ Отчета"):
+        lines.append(f"🆔 № {g('№ Отчета')}")
+    # Kim
+    lines.append("")
+    lines.append(f"👷 Yuborgan: {esc(e['name'])}")
     if cert:
-        lines.append(f"🔑 <b>Kabinet sertifikati:</b> {esc(cert)}")
-    lines.append(f"👷 <b>Yuborgan hodim:</b> {esc(e['name'])}")
-    if resp is not None and resp != e["tg_id"]:
-        lines.append(f"🧑‍💼 <b>Mas'ul hodim:</b> {esc(emp_name(resp))}")
+        lines.append(f"🔑 Sertifikat: {esc(cert)}")
+    if resp is not None and resp != e["tg_id"] and not note:      # ZAM/Boshliq yuborgan — mas'ul hodim ham ko'rinsin
+        lines.append(f"🧑‍💼 Mas'ul: {esc(emp_name(resp))}")
     if note:
         lines.append(note)
-    lines.append(f"#INN{inn}")
+    if level == "bad":
+        lines += ["", "❗️ <b>Zudlik bilan tekshiring!</b>"]
+    lines += ["", f"#INN{inn}"]
     send(OWNER, "\n".join(lines))
     return 200, {"ok": True}
 
@@ -983,15 +1044,17 @@ def _pct(v):
 
 def team_text(t, per):
     p = t["parts"]
-    lines = [f"👥 <b>{esc(t['lead']['name'])}</b> jamoasi — ball: <b>{_pct(t['score'])}</b>",
-             f"   📄 Hisobotlar ({period_label(per)}): {t['done']}/{t['need']} topshirildi"
-             + (f", {t['missing']} qarz" if t["missing"] else "") + (f", {t['late']} kech" if t["late"] else "")
-             + f" → {_pct(p['rep'])}",
-             f"   ⏰ Davomat: {_pct(p['att'])} · 💻 Korxona ishi: {_pct(p['work'])} · ⭐ Reyting: {_pct(p['rating'])}",
-             f"   🏢 Korxonalar: {t['comps']}"]
+    lines = [f"👥 <b>{esc(t['lead']['name'])} jamoasi</b>",
+             f"{eff_dot(t['score'])} Jamoa bali: <b>{_pct(t['score'])}</b>",
+             f"📄 Hisobotlar ({period_label(per)}): {t['done']}/{t['need']}"
+             + (f" · {t['missing']} qarz" if t["missing"] else "") + (f" · {t['late']} kech" if t["late"] else ""),
+             f"⏰ Davomat: {_pct(p['att'])}",
+             f"💻 Korxona ishi: {_pct(p['work'])}",
+             f"⭐ Reyting: {_pct(p['rating'])}",
+             f"🏢 Korxonalar: {t['comps']}", "", "<b>A'zolar:</b>"]
     for r in t["rows"]:
-        lines.append(f"   {'🎖' if r['lead'] else '•'} {esc(r['e']['name'])}: {_pct(r['score'])}"
-                     f" ({r['done']}/{r['need']} hisobot, {r['comps']} korxona)")
+        lines.append(f"{'🎖' if r['lead'] else '•'} {esc(r['e']['name'])} — <b>{_pct(r['score'])}</b>")
+        lines.append(f"      {r['done']}/{r['need']} hisobot · {r['comps']} korxona")
     return "\n".join(lines)
 
 
@@ -1000,9 +1063,9 @@ def teams_text():
     if not teams:
         return ("Hali Bosh buxgalter yo'q. Dashboard → Hodimlar jadvalida rolni <b>Bosh buxgalter</b> qiling, "
                 "keyin hodimlarni uning jamoasiga biriktiring.")
-    head = (f"👥 <b>Jamoalar samaradorligi</b>\nBall: hisobotlar {PERF_W['rep']}% + davomat {PERF_W['att']}% + "
-            f"korxona ishi {PERF_W['work']}% + reyting {PERF_W['rating']}%\n")
-    return head + "\n\n".join(team_text(t, base["per"]) for t in teams)
+    head = (f"👥 <b>Jamoalar samaradorligi</b>\n<i>Ball: hisobotlar {PERF_W['rep']}% · davomat {PERF_W['att']}% · "
+            f"korxona ishi {PERF_W['work']}% · reyting {PERF_W['rating']}%</i>\n\n")
+    return head + "\n\n━━━━━━━━━━\n\n".join(team_text(t, base["per"]) for t in teams)
 
 
 def debt_text(per=None):
@@ -1010,20 +1073,227 @@ def debt_text(per=None):
     m = period_matrix(per)
     tot, _by = matrix_counts(m)
     lines = [f"📋 <b>{period_label(per)} hisobotlari</b>",
-             f"Kerak: {tot['need']} · ✅ topshirildi: {tot['done']} · ⏳ qolgan: {tot['missing']} · ⚠️ xato/kech: {tot['bad']}",
-             f"Muddat (taxminan): {period_due(per):%d.%m.%Y}", ""]
+             f"🗓 Muddat: {period_due(per):%d.%m.%Y}", "",
+             f"Kerak: <b>{tot['need']}</b>",
+             f"✅ Topshirildi: <b>{tot['done']}</b>",
+             f"⏳ Qolgan: <b>{tot['missing']}</b>"]
+    if tot["bad"]:
+        lines.append(f"⚠️ Xato yoki kech: <b>{tot['bad']}</b>")
     groups = {}
     for r in m["rows"]:
         miss = [TAX_NAME[k] for k, cell in r["cells"].items() if cell["st"] in ("missing", "pending", "error")]
         if miss:
-            groups.setdefault(r["staff"] or "biriktirilmagan", []).append(f"   • {esc(r['c']['name'] or r['c']['inn'])}: "
-                                                                      f"{esc(', '.join(miss))}")
-    for who in sorted(groups):
-        lines.append(f"👷 <b>{esc(who)}</b> — {len(groups[who])} ta korxona")
-        lines += groups[who]
+            groups.setdefault(r["staff"] or "Biriktirilmagan", []).append(
+                f"• {esc(r['c']['name'] or r['c']['inn'])}\n      <i>{esc(', '.join(miss))}</i>")
+    for who in sorted(groups, key=lambda w: (w == "Biriktirilmagan", -len(groups[w]), w)):
+        lines += ["", f"👷 <b>{esc(who)}</b> — {len(groups[who])} ta korxona"] + groups[who]
     if not groups:
-        lines.append("🎉 Hamma hisobotlar topshirilgan.")
+        lines += ["", "🎉 Hamma hisobotlar topshirilgan."]
     lines.append(f"\n📊 Jadval: {current_url()}/hisobotlar?p={period_shift(per, 1)}")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------- soliq muddatlari eslatmasi (Soliq SOP bo'yicha)
+# Korxonaga qaysi soliq kerakligi — hisobotlar jadvalidagi majburiyatlardan (obligations, required=1).
+# Eslatma mas'ul hodimga 4 marta: muddatdan 5 kun oldin, 1 kun oldin, muddat kuni 10:00 va 14:30.
+# Eslatma kuni dam olish kuniga tushsa — oldingi ish kuniga suriladi (kech emas, erta eslatiladi).
+# Allaqachon topshirilgan (qabul qilingan / kech / tekshiruvda / "йук") hisobotlar eslatilmaydi.
+# (kalit, soliq kodi, nom, tur, muddat):
+#   "m" — har oy, davrdan keyingi oyning shu kuni (majburiyat "choraklik" bo'lsa — faqat 3,6,9,12-oylar)
+#   "q" — chorak (3,6,9-oy), keyingi oyning shu kuni;  "y" — yillik, keyingi yilning (oy, kun) sanasi
+#   "yc" — joriy yil uchun, shu yilning (oy, kun) sanasigacha
+DUE_RULES = [
+    ("nds", "nds", "QQS", "m", 20),
+    ("akciz", "akciz", "Aksiz solig'i", "m", 10),
+    ("enp", "enp", "Aylanmadan olinadigan soliq", "m", 10),
+    ("jshds", "jshds", "JShDS va ijtimoiy soliq", "m", 15),
+    ("inps", "inps", "INPS", "m", 15),
+    ("div", "div", "Dividend solig'i", "m", 15),
+    ("prib", "prib", "Foyda solig'i (chorak)", "q", 20),
+    ("prib_y", "prib", "Foyda solig'i (yillik)", "y", (3, 1)),
+    ("imush", "imush", "Mol-mulk solig'i (yillik)", "y", (3, 1)),
+    ("imush_m", "imush", "Mol-mulk solig'i ma'lumotnomasi", "y", (1, 10)),
+    ("zem", "zem", "Yer solig'i", "yc", (1, 20)),
+    ("voda", "voda", "Suv resurslari solig'i", "yc", (1, 20)),
+]
+DUE_TIPS = {
+    "nds": "QQS kodi faolligini, 1C va soliq kabinetini, kirim/chiqim hisob-fakturalarni tekshiring (9000, 6400, 4400).",
+    "akciz": "Imtiyoz huquqini tekshiring; kontragentlardan yakuniy iste'molchi emasligini tasdiqlovchi hujjatlarni so'rang.",
+    "prib": "Xarajatlar hujjat bilan tasdiqlanganini, QQS bazasidagi daromad 6-ilovaga mosligini tekshiring.",
+    "jshds": "Ish haqi hisob-kitobi va imtiyoz huquqini tekshiring.",
+    "inps": "Ish haqi hisob-kitobini tekshiring.",
+    "enp": "Daromadlar 1C va soliq ma'lumotlariga mosligini, imtiyoz huquqini tekshiring.",
+    "imush": "Imtiyoz huquqini tekshiring; yangi mulk paydo bo'lsa — 30 ish kunida ma'lumotnoma.",
+    "zem": "Imtiyoz huquqini tekshiring.",
+    "voda": "Joylashgan joyi bo'yicha; imtiyoz huquqini tekshiring.",
+}
+DUE_DONE = ("ok", "late", "wait", "na")
+TAX_REMIND = CFG.get("TAX_REMINDERS", True)
+# Rejim (meta.taxrem_mode): "test" — hodim xabarlari faqat rahbarga (kimga borishi yozilgan holda);
+# "on" — hodimlarga; "off" — yuborilmaydi. Botda: /eslatma test | on | off | sinov
+TAXREM_MODES = {"test": "🧪 TEST — faqat rahbarga", "on": "✅ Yoqilgan — hodimlarga", "off": "⏸ O'chirilgan"}
+
+
+def taxrem_mode():
+    v = (q("SELECT v FROM meta WHERE k='taxrem_mode'", one=True) or {"v": "test"})["v"]
+    return v if v in TAXREM_MODES else "test"
+# (slot, boshlanish, shu vaqtgacha yuboriladi, qaysi eslatmalar) — bot o'chib yonsa ham kun ichida yetkaziladi
+TAX_SLOTS = [("am", "10:00", "14:30", ("d0", "d1", "d5")), ("pm", "14:30", WORK_END, ("d0b",))]
+
+
+def prev_workday(d):
+    while not is_workday(d):
+        d -= timedelta(days=1)
+    return d
+
+
+def remind_days(legal):
+    """Qonuniy muddat -> eslatma kunlari {d5, d1, d0, d0b}."""
+    d0 = prev_workday(legal)
+    return {"d5": prev_workday(legal - timedelta(days=5)), "d1": prev_workday(d0 - timedelta(days=1)),
+            "d0": d0, "d0b": d0}
+
+
+def deadlines_between(a, b):
+    """[a, b] oralig'iga tushadigan qonuniy muddatlar: [{key, tax, label, kind, per, legal, check}]."""
+    out = []
+    for key, tax, label, kind, when in DUE_RULES:
+        if kind in ("m", "q"):
+            per = period_shift(f"{a:%Y-%m}", -2)
+            while True:
+                nxt = period_shift(per, 1)
+                legal = date(int(nxt[:4]), int(nxt[5:7]), when)
+                if legal > b:
+                    break
+                if legal >= a and (kind == "m" or int(per[5:7]) in (3, 6, 9)):
+                    out.append({"key": key, "tax": tax, "label": label, "kind": kind, "per": per, "legal": legal,
+                                "check": True})
+                per = nxt
+        else:
+            for y in range(a.year, b.year + 1):
+                legal = date(y, *when)
+                if a <= legal <= b:
+                    out.append({"key": key, "tax": tax, "label": label, "kind": kind,
+                                "per": f"{y - 1 if kind == 'y' else y}-12", "legal": legal,
+                                "check": key != "imush_m"})   # ma'lumotnoma jadvalda yo'q — doim eslatiladi
+    return out
+
+
+def due_items(dls):
+    """Muddatlar ro'yxati -> hali topshirilmagan hisobotlar (korxona, mas'ul hodim bilan)."""
+    if not dls:
+        return []
+    comps = {r["inn"]: r["name"] for r in q(f"SELECT inn, name FROM companies WHERE {LISTED}")}
+    obl = [o for o in q("SELECT * FROM obligations WHERE required=1") if o["inn"] in comps]
+    pers = sorted({dl["per"] for dl in dls})
+    done = {(f["inn"], f["period"], f["tax"]): f["status"] for f in
+            q(f"SELECT inn, period, tax, status FROM filings WHERE period IN ({','.join('?' * len(pers))})", pers)}
+    today = now().date().isoformat()
+    resp_cache, out = {}, []
+    for dl in dls:
+        for o in obl:
+            inn = o["inn"]
+            if o["tax"] != dl["tax"] or (dl["kind"] == "m" and o["freq"] == "q" and int(dl["per"][5:7]) % 3):
+                continue
+            st_ = done.get((inn, dl["per"], dl["tax"]))
+            if dl["check"] and st_ in DUE_DONE:
+                continue
+            if inn not in resp_cache:
+                r = responsible(inn, today)
+                resp_cache[inn] = r if r is not None and emp(r) else None
+            out.append(dict(dl, inn=inn, name=comps[inn] or inn, resp=resp_cache[inn], st=st_,
+                            quarterly=dl["kind"] == "q" or (dl["kind"] == "m" and o["freq"] == "q")))
+    return out
+
+
+def due_period_label(it):
+    y, m = it["per"][:4], int(it["per"][5:7])
+    if it["kind"] in ("y", "yc"):
+        return f"{y} yil"
+    if it["quarterly"]:
+        return f"{y}, {m // 3}-chorak"
+    return period_label(it["per"])
+
+
+DUE_HEAD = {"d0": "🔴 <b>BUGUN — oxirgi kun!</b>", "d0b": "🔴 <b>BUGUN — oxirgi kun, hali topshirilmagan!</b>",
+            "d1": "🟠 <b>Ertaga muddat tugaydi</b>", "d5": "🟡 <b>5 kun qoldi</b>"}
+
+
+def tax_reminder_text(by_kind, day):
+    lines = ["⏰ <b>Soliq hisobotlari eslatmasi</b>"]
+    tips = set()
+    for kind in ("d0", "d0b", "d1", "d5"):
+        items = by_kind.get(kind)
+        if not items:
+            continue
+        lines += ["", DUE_HEAD[kind]]
+        for legal in sorted({it["legal"] for it in items}):
+            d0 = remind_days(legal)["d0"]
+            lines.append(f"🗓 Muddat: <b>{legal:%d.%m.%Y}</b>"
+                         + (f" — dam olish kuni, <b>{d0:%d.%m}</b> gacha topshiring" if d0 != legal else ""))
+            for it in sorted((i for i in items if i["legal"] == legal), key=lambda i: (i["name"].lower(), i["label"])):
+                bad = " ❗️ <i>xato bilan qaytgan — qayta topshiring</i>" if it["st"] == "error" else ""
+                lines.append(f"• <b>{esc(it['name'])}</b> — {esc(it['label'])} ({due_period_label(it)}){bad}")
+                if kind == "d5":
+                    tips.add(it["tax"])
+    tips = [DUE_TIPS[t] for t, _n, _x in TAXES if t in tips and t in DUE_TIPS]
+    if tips:
+        lines += ["", "📌 <b>Topshirishdan oldin:</b>"] + [f"– {esc(t)}" for t in tips]
+    lines += ["", "Topshirilgan hisobot bot orqali o'zi belgilanadi — keyingi eslatmada chiqmaydi."]
+    return "\n".join(lines)
+
+
+def tax_reminders(day, kinds, dry=False, mode=None):
+    """`day` kuni `kinds` eslatmalarini mas'ul hodimlarga yuboradi. -> {tg_id yoki None: {kind: [item]}}
+    mode "test" — har hodimning xabari rahbarga boradi (sarlavhada kimga borishi yoziladi)."""
+    mode = mode or taxrem_mode()
+    dls = [dl for dl in deadlines_between(day, day + timedelta(days=20))
+           if any(remind_days(dl["legal"])[k] == day for k in kinds)]
+    plan = {}
+    for it in due_items(dls):
+        rd = remind_days(it["legal"])
+        for k in kinds:
+            if rd[k] == day:
+                plan.setdefault(it["resp"], {}).setdefault(k, []).append(it)
+    if dry or mode == "off":
+        return plan
+    for uid, by_kind in plan.items():
+        if uid is None:
+            continue
+        text = tax_reminder_text(by_kind, day)
+        if mode == "test":
+            ok = send(OWNER, f"🧪 <b>TEST</b> — bu xabar hodimga borardi: <b>{esc(emp_name(uid))}</b> "
+                             f"({day:%d.%m.%Y})\n━━━━━━━━━━\n" + text, owner_only=True)
+        else:
+            ok = send(uid, text)
+        log("TAXREM", mode, day, ",".join(kinds), uid, sum(len(v) for v in by_kind.values()), "ok" if ok else "FAIL")
+    if plan.get(None):
+        log("TAXREM unassigned", day, sorted({i["inn"] for v in plan[None].values() for i in v}))
+    return plan
+
+
+def deadlines_text(days=10):
+    """Rahbar uchun: yaqin kunlardagi muddatlar va kimda nechta topshirilmagan hisobot bor."""
+    d = now().date()
+    items = due_items(deadlines_between(d, d + timedelta(days=days)))
+    lines = [f"⏰ <b>Yaqin {days} kundagi soliq muddatlari</b>",
+             f"<i>Eslatma hodimga: 5 kun va 1 kun oldin, muddat kuni 10:00 va 14:30</i>"]
+    if not items:
+        return "\n".join(lines + ["", "🎉 Topshirilmagan hisobot yo'q."])
+    for legal in sorted({i["legal"] for i in items}):
+        day_items = [i for i in items if i["legal"] == legal]
+        lines += ["", f"🗓 <b>{legal:%d.%m.%Y}</b> (eslatma: {remind_days(legal)['d5']:%d.%m}, "
+                      f"{remind_days(legal)['d1']:%d.%m}, {remind_days(legal)['d0']:%d.%m})"]
+        for label in sorted({i["label"] for i in day_items}):
+            li = [i for i in day_items if i["label"] == label]
+            who = {}
+            for i in li:
+                who[emp_name(i["resp"]) if i["resp"] else "Biriktirilmagan"] = who.get(
+                    emp_name(i["resp"]) if i["resp"] else "Biriktirilmagan", 0) + 1
+            lines.append(f"• {esc(label)}: <b>{len(li)}</b> ta — "
+                         + ", ".join(f"{esc(w)} {n}" for w, n in sorted(who.items(), key=lambda x: -x[1])))
+    if any(i["resp"] is None for i in items):
+        lines += ["", "⚠️ Biriktirilmagan korxonalarga eslatma bormaydi — hodimga biriktiring."]
     return "\n".join(lines)
 
 
@@ -1123,6 +1393,40 @@ def apply_saved_rating(inn):
     if r:
         q("UPDATE companies SET rating=COALESCE(NULLIF(rating,''),?), rating_ts=COALESCE(rating_ts,?) WHERE inn=?",
           (r["v"], now().isoformat(), inn))
+        record_rating(inn, r["v"], "soliq")
+
+
+# ---------------------------------------------------------------- reyting tarixi (dinamika grafigi uchun)
+def record_rating(inn, rv, src):
+    """Reyting tarixiga yozadi: qiymat o'zgargan bo'lsa yoki shu oyda hali yozuv bo'lmasa (har oyga nuqta)."""
+    if not rv:
+        return
+    ts = now().isoformat(timespec="seconds")
+    last = q("SELECT rating, ts FROM rating_hist WHERE inn=? ORDER BY ts DESC LIMIT 1", (inn,), one=True)
+    if last and last["rating"] == rv and last["ts"][:7] == ts[:7]:
+        return
+    q("INSERT INTO rating_hist(inn,ts,rating,num,src) VALUES(?,?,?,?,?)", (inn, ts, rv, _rating_num(rv), src))
+
+
+def rating_history(inn):
+    """Grafik uchun: har oy oxirgi reyting + barcha o'zgarishlar."""
+    rows = [dict(r) for r in q("SELECT ts, rating, num, src FROM rating_hist WHERE inn=? ORDER BY ts", (inn,))]
+    months = {}
+    for r in rows:
+        months[r["ts"][:7]] = r
+    pts = []
+    for m, r in sorted(months.items()):
+        g, _t = rating_grade(r["rating"])
+        pts.append({"m": m, "label": period_label(m), "rating": r["rating"], "num": r["num"], "grade": g,
+                    "ts": r["ts"][:16].replace("T", " ")})
+    for i, p in enumerate(pts):
+        prev = pts[i - 1]["num"] if i else None
+        p["delta"] = (p["num"] - prev) if (p["num"] is not None and prev is not None) else None
+    c = q("SELECT name, rating FROM companies WHERE inn=?", (inn,), one=True)
+    return {"name": (c and c["name"]) or inn, "cur": (c and c["rating"]) or "", "points": pts,
+            "changes": [{"ts": r["ts"][:16].replace("T", " "), "rating": r["rating"],
+                         "src": {"soliq": "soliq.uz", "manual": "qo‘lda"}.get(r["src"], r["src"] or "")}
+                        for r in reversed(rows)][:30]}
 
 
 def purge_company(inn):
@@ -1404,6 +1708,8 @@ Pastdagi tugmalar orqali ham ishlatish mumkin (/menu).
 /forgive TG_ID — oxirgi qoidabuzarlikni bekor qilish
 /jamoa — Bosh buxgalter jamoalari samaradorligi
 /qarz [10.2026] — qaysi korxonaning qaysi hisoboti hali topshirilmagan (standart: o'tgan oy)
+/muddatlar [kun] — yaqin soliq muddatlari va kimda nechta hisobot qolgan (hodimga 4 marta eslatma boradi)
+/eslatma [test|on|off|sinov] — soliq eslatmalari rejimi
 /dashboard — dashboard havolasi
 {st.HELP}
 
@@ -1417,7 +1723,8 @@ MENU = {
                                 [("📋 Ro'yxat", "cmd:/list"), ("💰 Maosh belgilash", "hint:salary")],
                                 [("👥 Jamoalar (Bosh buxgalter)", "cmd:/jamoa"), ("🙏 Jarimani bekor qilish", "hint:forgive")]]),
     "🏢 Korxonalar": ("Korxonalar", [[("➕ Hodimga biriktirish", "cmd:/firma"), ("⇄ Ko'chirish", "cmd:/kochir")],
-                                    [("📜 Tarix", "cmd:/tarix"), ("📋 Topshirilmaganlar", "cmd:/qarz")]]),
+                                    [("📜 Tarix", "cmd:/tarix"), ("📋 Topshirilmaganlar", "cmd:/qarz")],
+                                    [("⏰ Soliq muddatlari", "cmd:/muddatlar")]]),
     "📊 Davomat": ("Davomat va hisobotlar", [[("📅 Bugun", "cmd:/today"), ("🗓 Hafta", "cmd:/week"), ("📆 Oy", "cmd:/month")],
                                             [("📈 Dashboard havolasi", "cmd:/dashboard")]]),
     "🖥 Kompyuterlar": ("Kompyuterlar (screen time)", [[("⏱ Bugungi screen time", "cmd:/screen"), ("📡 Hozir kim nima qilyapti", "cmd:/onlayn")],
@@ -1637,6 +1944,27 @@ def handle_owner(text):
                 return send(OWNER, "Oy 1–12 bo'lishi kerak. Masalan: /qarz 10.2026")
             per = f"{yy}-{mm:02d}"
         send(OWNER, debt_text(per))
+    elif cmd in ("/muddat", "/muddatlar"):
+        days = int(args[0]) if args and args[0].isdigit() else 10
+        send(OWNER, deadlines_text(min(max(days, 1), 60)))
+    elif cmd == "/eslatma":
+        a = (args[0].lower() if args else "")
+        if a in TAXREM_MODES:
+            q("INSERT OR REPLACE INTO meta(k,v) VALUES('taxrem_mode',?)", (a,))
+            return send(OWNER, f"⏰ Soliq eslatmalari: {TAXREM_MODES[a]}")
+        if a == "sinov":   # keyingi eslatma kunida hodimlarga boradigan xabarlar — hozir rahbarga
+            d = now().date()
+            for i in range(0, 40):
+                day = d + timedelta(days=i)
+                plan = tax_reminders(day, ("d0", "d1", "d5"), dry=True)
+                if any(k is not None for k in plan):
+                    tax_reminders(day, ("d0", "d1", "d5"), mode="test")
+                    return send(OWNER, f"☝️ Yuqoridagilar — {day:%d.%m.%Y} kuni 10:00 da hodimlarga boradigan "
+                                       f"eslatmalar. Rejim: {TAXREM_MODES[taxrem_mode()]}")
+            return send(OWNER, "Yaqin 40 kunda eslatma yuboriladigan hisobot topilmadi.")
+        send(OWNER, f"⏰ Soliq eslatmalari: {TAXREM_MODES[taxrem_mode()]}\n\n"
+                    "/eslatma test — faqat rahbarga (sinov)\n/eslatma on — hodimlarga yuborish\n"
+                    "/eslatma off — o'chirish\n/eslatma sinov — keyingi eslatmalarni hozir rahbarga ko'rsatish")
     elif cmd == "/dashboard":
         url = current_url()
         send(OWNER, f"📈 Dashboard: {url}/dashboard\n📋 Hisobotlar jadvali: {url}/hisobotlar\n"
@@ -1689,8 +2017,18 @@ def _handle_message(msg, uid, text, admin):
     if cmd0 == "/parol":          # boshliqqa alohida parol berilmaydi
         q("UPDATE employees SET pw_hash=NULL WHERE tg_id=?", (uid,))
         return send(uid, "Alohida parol kerak emas — dashboard'ga umumiy login bilan kiriladi.")
-    # Boshliq ham hodim: /key, /me, /agent — hodim sifatida javob oladi
-    if admin and text.startswith("/") and not (uid != OWNER and cmd0 in ("/key", "/me", "/agent")):
+    # Owner ham skriptni o'z kompyuterida ishlatishi mumkin: /key — unga ham kalit (bir marta "Boshliq" sifatida
+    # hodimlar ro'yxatiga yoziladi: davomatdan ozod, korxona biriktirsa bo'ladi, xabarlar ikki marta kelmaydi).
+    if uid == OWNER and cmd0 == "/key" and not emp(uid):
+        frm = msg.get("from", {})
+        name = " ".join(x for x in (frm.get("first_name"), frm.get("last_name")) if x)[:80] or "Rahbar"
+        q("INSERT INTO employees(tg_id,name,api_key,active,created,role) VALUES(?,?,?,1,?,'boshliq') "
+          "ON CONFLICT(tg_id) DO UPDATE SET active=1, role='boshliq'",
+          (uid, name, secrets.token_urlsafe(9), now().isoformat()))
+        log("OWNER KEY created")
+    # Boshliq (va hodimlar ro'yxatida bo'lsa owner) ham hodim: /key, /me — hodim sifatida javob oladi
+    if admin and text.startswith("/") and not (cmd0 in ("/key", "/me") and emp(uid)) \
+            and not (uid != OWNER and cmd0 == "/agent"):
         PENDING.clear()  # yangi buyruq — kutilayotgan kiritish bekor
         # Bir xabarda bir nechta buyruq bo'lsa (har biri yangi qatorda) — bittadan bajariladi.
         for line in text.splitlines():
@@ -1807,7 +2145,18 @@ def scheduler():
                 if d == last_wd and n >= at(d, WORK_END) + timedelta(minutes=5) and once(f"weekly:{d}"):
                     a, b = week_range(d)
                     send(OWNER, summary_text("Haftalik hisobot", a, b))
+            if TAX_REMIND:                                    # soliq muddatlari eslatmasi (hodimlarga)
+                for slot, start, until, kinds in TAX_SLOTS:
+                    if at(d, start) <= n < at(d, until) and once(f"taxrem:{d}:{slot}"):
+                        try:
+                            tax_reminders(d, kinds)
+                        except Exception:
+                            log("TAXREM ERROR", traceback.format_exc())
             st.tick(n)
+            if once(f"rec_cleanup:{n:%Y-%m-%d %H}"):          # soatda bir: muddati o'tgan ekran yozuvlari o'chadi
+                k = st.rec_cleanup()
+                if k:
+                    log("REC cleanup:", k, "kun o'chirildi")
         except Exception:
             traceback.print_exc()
         time.sleep(30)
@@ -1956,7 +2305,7 @@ LOGIN_MSG = {"bad": "Login yoki parol noto‘g‘ri", "expired": "1 soat harakat
 BRAND_HEAD = ('<link rel="preconnect" href="https://fonts.googleapis.com">'
               '<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>'
               '<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&display=swap">'
-              '<link rel="icon" href="/brand/logo.png">')
+              '<link rel="icon" href="/brand/logo.png">' + i18n.HEAD)   # UZ/RU/EN tanlash (i18n.py)
 BRAND_CSS = """
 :root{--ink:#2C2B29;--mut:#857a70;--acc:#F28322;--acc-deep:#ED6A23;--acc-soft:rgba(242,131,34,.12);
 --grad:linear-gradient(135deg,#F39614 0%,#ED6A23 100%);
@@ -2537,9 +2886,17 @@ td.co,th.co{position:sticky;left:0;z-index:1;background:var(--solid);min-width:2
 thead th.co{z-index:3}
 td.co b{font-weight:600;cursor:pointer}td.co b:hover{color:var(--acc)}
 tbody tr:hover td{background:var(--acc-soft)}tbody tr:hover td.co{background:var(--solid)}
-td.n{color:var(--mut);font-size:12px;text-align:right;white-space:nowrap}
-td.n .mv{display:inline-flex;flex-direction:column;gap:2px;vertical-align:middle;margin-right:6px}
-td.n .up{border:0;background:var(--acc-soft);color:var(--acc);border-radius:6px;width:22px;height:16px;padding:0;
+td.n{color:var(--mut);font-size:12px;text-align:right;white-space:nowrap;cursor:pointer;user-select:none}
+td.n:hover{color:var(--acc)}
+tr.pick td,tr.pick td.co{background:#fdf0c2!important}tr.pick td.n{color:#92400e;font-weight:700}
+@media (prefers-color-scheme:dark){tr.pick td,tr.pick td.co{background:#4a3a12!important}tr.pick td.n{color:#fde68a}}
+th.nh{min-width:62px!important}
+th.nh .mv{display:flex;gap:4px;margin-bottom:6px}
+th.nh .up{border:1px solid var(--line);background:var(--solid);color:var(--acc);border-radius:7px;width:26px;height:24px;
+padding:0;font-size:11px;line-height:22px;cursor:pointer;transition:background .15s,transform .12s}
+th.nh .up:hover:not(:disabled){background:var(--acc-soft);transform:translateY(-1px)}
+th.nh .up:disabled{color:var(--mut);opacity:.4;cursor:default}
+td.n .up{display:none;
 font-size:9px;line-height:16px;cursor:pointer;opacity:.35;transition:opacity .15s,transform .12s}
 tr:hover td.n .up{opacity:1}td.n .up:hover{transform:translateY(-1px);filter:brightness(1.1)}
 tr.moved td{animation:mv .9s}@keyframes mv{from{background:rgba(249,115,22,.22)}}
@@ -2562,7 +2919,17 @@ td.x.pending>div{box-shadow:inset 0 0 0 1.5px var(--y);border-radius:6px;margin:
 td.x.na,td.x.never{color:var(--n);font-weight:500}td.x.never{opacity:.55}
 td.x.note{background:var(--n-bg);color:var(--ink);font-weight:500;white-space:normal}
 tr.gone td{opacity:.6}
-td.rt{font-weight:700;font-size:13px;text-align:center;min-width:76px;letter-spacing:.02em}
+td.rt{font-weight:700;font-size:13px;text-align:center;min-width:76px;letter-spacing:.02em;cursor:pointer}
+td.rt:hover{box-shadow:inset 0 0 0 2px rgba(249,115,22,.45)}
+dialog.rtd{width:min(700px,calc(100vw - 32px))}
+.rtsvg{width:100%;height:auto;display:block;margin:14px 0 6px}
+.rtsvg text{font-size:11px;fill:var(--mut);font-family:inherit}.rtsvg .pv{font-size:12px;font-weight:700}
+.rtsvg .gl{stroke:var(--line);stroke-dasharray:3 4}.rtsvg .ln{fill:none;stroke:#f97316;stroke-width:3;stroke-linejoin:round;stroke-linecap:round}
+.rtsvg .ar{fill:rgba(249,115,22,.10)}
+.rt-empty{padding:30px 10px;text-align:center;color:var(--mut)}
+.rtl{max-height:220px;overflow:auto;margin-top:6px}
+.rtr{display:grid;grid-template-columns:1fr 80px 80px 130px;gap:10px;align-items:center;padding:7px 4px;border-bottom:1px solid var(--line);font-size:13px}
+.rtr .dl{font-weight:600;font-size:12px}.ru{color:#16a34a}.rd{color:#dc2626}.re{color:var(--mut)}
 td.rt.gA{color:#15803d;background:rgba(34,197,94,.14)}td.rt.gB{color:#4d7c0f;background:rgba(132,204,22,.16)}
 td.rt.gC{color:#c2410c;background:rgba(251,146,60,.18)}td.rt.gD,td.rt.gE{color:#b91c1c;background:rgba(239,68,68,.14)}
 td.per{font-weight:600;color:var(--ink);white-space:nowrap}
@@ -2640,13 +3007,23 @@ async function api(data){
  let j=null;try{j=await r.json()}catch(e){}
  if(!j||!j.ok){alert((j&&j.error)||'Saqlanmadi — sessiya tugagan bo‘lishi mumkin. Sahifani yangilang.');throw new Error('save')}
  return j}
-// ▲ — korxona ro'yxatda bir qator tepaga (saqlanadi; qatorlar raqami qayta yoziladi)
-$$('td.n .up').forEach(b=>b.onclick=async e=>{e.stopPropagation();const tr=b.closest('tr'),dn=b.dataset.d==='down',
- nb=dn?tr.nextElementSibling:tr.previousElementSibling;
- if(!nb||!nb.dataset.inn)return;b.disabled=true;
+// Tartib (1C kabi): qatorni bosib tanlang — № sarlavhasidagi ▲/▼ (yoki Alt+↑/↓) bilan tepaga/pastga suring
+let PICK=null,BUSY=false;
+function selRow(tr){if(PICK)PICK.classList.remove('pick');PICK=tr||null;if(PICK)PICK.classList.add('pick');
+ $$('th.nh .up').forEach(b=>b.disabled=!PICK)}
+async function moveRow(dn){const tr=PICK;if(!tr||BUSY)return;const nb=dn?tr.nextElementSibling:tr.previousElementSibling;
+ if(!nb||!nb.dataset.inn)return;BUSY=true;
  try{await api({kind:dn?'down':'up',inn:tr.dataset.inn});tr.parentNode.insertBefore(tr,dn?nb.nextSibling:nb);
   let n=0;tr.parentNode.querySelectorAll('tr[data-inn] .nn').forEach(s=>s.textContent=++n);
-  tr.classList.remove('moved');void tr.offsetWidth;tr.classList.add('moved')}catch(x){}finally{b.disabled=false}});
+  tr.scrollIntoView({block:'nearest'});tr.classList.remove('moved');void tr.offsetWidth;tr.classList.add('moved')}
+ catch(x){}finally{BUSY=false}}
+if($('th.nh .up')){
+ $$('td.n').forEach(td=>td.onclick=e=>{e.stopPropagation();const tr=td.closest('tr');selRow(PICK===tr?null:tr)});
+ $('#pane-sheet tbody').addEventListener('click',e=>{const tr=e.target.closest('tr[data-inn]');if(tr&&!e.target.closest('td.n'))selRow(tr)},true);
+ $$('th.nh .up').forEach(b=>b.onclick=e=>{e.stopPropagation();moveRow(b.dataset.d==='down')});
+ addEventListener('keydown',e=>{if(!PICK||!e.altKey||(e.key!=='ArrowUp'&&e.key!=='ArrowDown'))return;
+  if(document.activeElement&&document.activeElement.isContentEditable)return;e.preventDefault();moveRow(e.key==='ArrowDown')});
+ selRow(null)}
 // Matnli kataklar: bosing — yozing — Enter (Esc — bekor)
 $$('td.ed').forEach(td=>{
  td.onclick=()=>{if(td.isContentEditable)return;closeMenu();td.dataset.old=td.textContent;td.contentEditable='true';td.focus();
@@ -2658,6 +3035,32 @@ $$('td.ed').forEach(td=>{
   try{const j=await api({kind:'co',inn:td.closest('tr').dataset.inn,field:td.dataset.f,v});td.textContent=j.text;
    if(td.dataset.f==='rating')td.className='ed rt g'+(j.grade||'');
    td.classList.add('saved');setTimeout(()=>td.classList.remove('saved'),1300)}catch(e){td.textContent=td.dataset.old}}});
+// Reyting katagi: bosing — oylar bo'yicha dinamika grafigi (tahrirlash — oyna ichidagi tugma)
+const E=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const RG={A:'#16a34a',B:'#65a30d',C:'#ea580c',D:'#dc2626',E:'#b91c1c'};let rtTd=null;
+function rtChart(P){if(!P.length)return '<div class="rt-empty">Reyting hali kelmagan. Hodim soliq.uz kabinetiga kirganda o‘zi yoziladi yoki qo‘lda kiriting.</div>';
+ const W=620,H=240,L=38,R=16,T=18,B=40,n=P.length,xs=i=>n===1?L+(W-L-R)/2:L+i*(W-L-R)/(n-1),ys=v=>T+(100-v)/100*(H-T-B);
+ let s=`<svg viewBox="0 0 ${W} ${H}" class="rtsvg" role="img" aria-label="Reyting dinamikasi">`;
+ [0,25,50,75,100].forEach(v=>{s+=`<line x1="${L}" x2="${W-R}" y1="${ys(v)}" y2="${ys(v)}" class="gl"/><text x="${L-8}" y="${ys(v)+4}" text-anchor="end">${v}</text>`});
+ const pts=P.filter(p=>p.num!=null);
+ if(pts.length>1){const d=pts.map((p,i)=>`${i?'L':'M'}${xs(P.indexOf(p))},${ys(p.num)}`).join(' ');
+  s+=`<path d="${d} L${xs(P.indexOf(pts[pts.length-1]))},${ys(0)} L${xs(P.indexOf(pts[0]))},${ys(0)} Z" class="ar"/><path d="${d}" class="ln"/>`}
+ P.forEach((p,i)=>{const x=xs(i);s+=`<text x="${x}" y="${H-14}" text-anchor="middle">${E(p.label)}</text>`;
+  if(p.num==null)return;const y=ys(p.num),c=RG[p.grade]||'#97755e';
+  s+=`<circle cx="${x}" cy="${y}" r="6" fill="${c}" stroke="#fff" stroke-width="2"><title>${E(p.label)}: ${E(p.rating)} (${E(p.ts)})</title></circle>`+
+   `<text x="${x}" y="${y-12}" text-anchor="middle" class="pv" fill="${c}">${E(p.rating)}</text>`});
+ return s+'</svg>'}
+function rtList(P){return P.slice().reverse().map(p=>{const d=p.delta,cl=d==null?'':d>0?'ru':d<0?'rd':'re';
+ return `<div class="rtr"><span>${E(p.label)}</span><b style="color:${RG[p.grade]||'inherit'}">${E(p.rating)}</b>`+
+  `<span class="dl ${cl}">${d==null?'—':d>0?'▲ +'+d:d<0?'▼ '+d:'= 0'}</span><span class="sub">${E(p.ts)}</span></div>`}).join('')}
+async function openRating(td){rtTd=td;const dl=$('#dRt'),tr=td.closest('tr');$('#rtT').textContent=tr.dataset.name+' — reyting dinamikasi';
+ $('#rtS').textContent='Yuklanmoqda…';$('#rtC').innerHTML='';$('#rtL').innerHTML='';dl.showModal();
+ try{const j=await api({kind:'rhist',inn:tr.dataset.inn}),P=j.points,last=P[P.length-1],first=P[0];
+  const ch=P.length>1&&last.num!=null&&first.num!=null?last.num-first.num:null;
+  $('#rtS').innerHTML=`Hozir: <b>${E(j.cur||'—')}</b> · ${P.length} oy`+(ch==null?'':` · ${E(first.label)} dan beri <b class="${ch>0?'ru':ch<0?'rd':''}">${ch>0?'+':''}${ch} ball</b>`);
+  $('#rtC').innerHTML=rtChart(P);$('#rtL').innerHTML=rtList(P)}catch(e){dl.close()}}
+$$('td.rt').forEach(td=>{const edit=td.onclick;td._edit=edit;td.onclick=e=>{if(td.isContentEditable)return;e.stopPropagation();openRating(td)}});
+$('#rtEdit').onclick=()=>{$('#dRt').close();if(rtTd&&rtTd._edit)rtTd._edit()};
 // Soliq kataklari: bosing — tafsilot va tanlov
 const menu=$('#menu');let cur=null;
 function closeMenu(){menu.hidden=true;if(cur)cur.classList.remove('sel');cur=null}
@@ -2720,7 +3123,7 @@ WORDS = {"ok": "топширилган", "late": "кечикиб топшири�
          "missing": "топширилмаган", "pending": "кутилмоқда"}
 LOG_FIELDS = ["№ Отчета", "№ Пакет", "Наименование", "Год", "Период", "Дата отправки", "Состояние", "Причина ошибки",
               "Дата проверки", "Инспектор", "Регион", "Сертификат", "Дата создания", "IP адрес"]
-CO_FIELDS = {"name": 120, "activity": 80, "staff": 80, "c1": 40, "note": 500, "regime": 40, "perk": 40, "rating": 20}
+CO_FIELDS = {"name": 120, "activity": 80, "staff": 80, "c1": 40, "note": 500, "regime": 40, "perk": 40, "rating": 20, "aliases": 300}
 # Ro'yxatdan tanlanadigan ustunlar (Excel'dagi "Солик режими" va "Период"); "boshqa" matn ham yozish mumkin.
 REGIMES = ["Айланма", "НДС", "ЯТТ", "Фикс"]
 PERKS = ["Ойлик", "Чораклик", "Йиллик"]
@@ -2804,12 +3207,22 @@ def period_reports(per):
 
 
 def rating_grade(r):
-    """'С - 34' / 'A-80' -> ('C', 'C · 34'). Kirill harflar lotinga."""
+    """'С - 34' / 'CC-37' / 'A-80' -> ('C', 'CC · 37'). Kirill harflar lotinga.
+    Birinchi qiymat — rang uchun asosiy harf; harflar 1–3 ta bo'lishi mumkin (soliq.uz: A, BB, CCC...)."""
     s = str(r or "").strip().upper().translate(str.maketrans("АБВСДЕ", "ABBCDE"))
-    m = re.match(r"^([A-E])\s*[-–:·]?\s*(\d{1,3})?", s)
+    m = re.match(r"^([A-E]{1,3})\s*[-–:·]?\s*(\d{1,3})?", s)
     if not m:
         return "", esc(r or "")
-    return m.group(1), m.group(1) + (f" · {m.group(2)}" if m.group(2) else "")
+    return m.group(1)[0], m.group(1) + (f" · {m.group(2)}" if m.group(2) else "")
+
+
+def rating_norm(r):
+    """Saqlash uchun: 'сс-37' / 'CC 37' -> 'CC - 37'; noto'g'ri bo'lsa ''."""
+    s = str(r or "").strip().upper().translate(str.maketrans("АБВСДЕ", "ABBCDE"))
+    m = re.match(r"^([A-E]{1,3})\s*[-–:·]?\s*(\d{1,3})?", s)
+    if not m:
+        return ""
+    return m.group(1) + (f" - {m.group(2)}" if m.group(2) else "")
 
 
 def render_matrix(nav, flash=""):
@@ -2830,9 +3243,10 @@ def render_matrix(nav, flash=""):
     head = "".join(f'<th title="{esc(n)}">{esc(x)}</th>' for _k, n, x in TAXES)
     body = []
     # Tarix (Excel) davrlarida ro'yxat to'liq emas — tartibni faqat joriy davrlarda o'zgartirish mumkin
-    up_btn = "" if is_hist(per) else ('<span class="mv"><button class="up" data-d="up" title="Bir qator tepaga" '
-                                      'aria-label="Tepaga">▲</button><button class="up" data-d="down" '
-                                      'title="Bir qator pastga" aria-label="Pastga">▼</button></span>')
+    mv_btns = "" if is_hist(per) else ('<span class="mv"><button type="button" class="up" data-d="up" '
+                                       'title="Tanlangan korxonani bir qator tepaga (Alt+↑)" aria-label="Tepaga">▲</button>'
+                                       '<button type="button" class="up" data-d="down" '
+                                       'title="Tanlangan korxonani bir qator pastga (Alt+↓)" aria-label="Pastga">▼</button></span>')
     for i, r in enumerate(m["rows"], 1):
         c = r["c"]
         tds, miss = [], False
@@ -2857,9 +3271,12 @@ def render_matrix(nav, flash=""):
         body.append(
             f'<tr{" class=gone" if gone else ""} data-k="{esc(key)}" data-s="{esc(r["staff"] or "—")}" '
             f'data-m="{1 if miss else 0}" data-inn="{esc(c["inn"])}" data-name="{esc(c["name"] or c["inn"])}">'
-            f'<td class="n">{up_btn}<span class="nn">{i}</span></td><td class="co ed" data-f="name">{esc(c["name"] or "")}</td>'
+            f'<td class="n" title="Bosing — tanlash, so‘ng № ustidagi ▲/▼ bilan suring"><span class="nn">{i}</span></td><td class="co ed" data-f="name">{esc(c["name"] or "")}</td>'
             f'<td class="ed" data-f="activity">{esc(c.get("activity") or "")}</td><td class="ro">{esc(c["inn"])}</td>{rt_td}'
             f'{staff_td}<td class="ed" data-f="c1">{esc(c.get("c1") or "")}</td>{rp_td}{"".join(tds)}'
+            f'<td class="ed al" data-f="aliases" style="min-width:150px" title="Telegram guruh / chat nomi, qisqa nom, '
+            f'1C baza nomi — vergul bilan. Shu so‘zlar oyna nomida ko‘rinsa, ish shu korxonaga yoziladi">'
+            f'{esc(c.get("aliases") or "")}</td>'
             f'<td class="ed" data-f="note" style="min-width:160px">{esc(c.get("note") or "")}</td>'
             f'<td class="del"><form class="hide" method="post" action="/dashboard/company">'
             f'<input type="hidden" name="inn" value="{esc(c["inn"])}"><input type="hidden" name="act" value="hide">'
@@ -2940,10 +3357,10 @@ hodimlar soliq.uz da “Отправить” bosgach katak o‘zi to‘ladi</p>
 <p class="sub" style="margin:0 4px 10px">Matnli katakni bosing va yozing (Enter — saqlash, Esc — bekor).
 Soliq katagini bosing — soliq.uz dan kelgan hamma ma’lumot va o‘zgartirish. Yashil — topshirilgan, sariq — tekshiruvda,
 to‘q sariq — kech, qizil — xato, qizil ramka — qarz.</p>
-<div class="card glass"><table class="sheet"><thead><tr><th class="l">№</th><th class="co l">Наименование организации</th>
+<div class="card glass"><table class="sheet"><thead><tr><th class="l nh">{mv_btns}№</th><th class="co l">Наименование организации</th>
 <th class="l">Вид деятельности</th><th class="l">ИНН</th><th class="l">Рейтинг</th><th class="l">Ходимлар</th><th class="l">1C</th>
 <th class="l">Солиқ режими</th><th class="l">Период</th>{head}
-{'<th class="l">Бошқа ҳисоботлар</th>' if m['other'] else ''}<th class="l">Изоҳ</th><th></th></tr></thead>
+{'<th class="l">Бошқа ҳисоботлар</th>' if m['other'] else ''}<th class="l" title="Telegram guruh / chat nomi, qisqa nom — vergul bilan">Chat / kalit so‘zlar</th><th class="l">Изоҳ</th><th></th></tr></thead>
 <tbody>{''.join(body) or '<tr><td colspan="24" class="mut">Korxonalar yo‘q — “+ Mijoz” tugmasini bosing</td></tr>'}</tbody></table></div>
 </div>
 <div id="pane-log" class="pane" hidden>
@@ -2965,6 +3382,10 @@ hamma hisobotlar — har bir maydon bilan (oxirgi holati).</p>
 <button data-v="obl:never">umuman topshirmaydi</button></div></div>
 <div id="pick" hidden><div class="mh"></div><div class="opts"></div>
 <form><input placeholder="Boshqa matn yozing…" maxlength="40"><button>OK</button></form></div>
+<dialog id="dRt" class="wide rtd"><h3 id="rtT"></h3><div class="sub" id="rtS"></div><div id="rtC"></div>
+<div id="rtL" class="rtl"></div>
+<div class="acts"><button type="button" class="btn ghost" id="rtEdit">Reytingni qo‘lda o‘zgartirish</button>
+<button type="button" class="btn" data-close>Yopish</button></div></dialog>
 <dialog id="dTrash" class="wide"><h3>Karzina</h3>
 <p class="sub" style="margin:0 0 12px">Bu korxonalar jadvalda ko‘rinmaydi va ular haqida botga xabar kelmaydi.
 “Qaytarish” — ro‘yxatga qaytadi; “Butunlay o‘chirish” — hamma ma’lumoti bilan o‘chadi.</p>
@@ -3025,6 +3446,8 @@ def matrix_api(f):
     if len(inn) not in (9, 14) or not re.match(r"^\d{4}-(0[1-9]|1[0-2])$", per):
         return {"ok": False, "error": "Noto'g'ri so'rov — sahifani yangilang"}
     kind, v = f.get("kind", ""), f.get("v", "")
+    if kind == "rhist":                      # reyting dinamikasi (grafik oynasi)
+        return {"ok": True, **rating_history(inn)}
     if kind in ("up", "down"):
         # Ro'yxatda bir qator tepaga/pastga: tartib 1..N qilib yoziladi va qo'shni korxona bilan joy almashadi.
         with LOCK:
@@ -3056,15 +3479,21 @@ def matrix_api(f):
         if field == "name" and not val:
             return {"ok": False, "error": "Korxona nomi bo'sh bo'lmasin"}
         grade = ""
-        if field == "rating" and val:      # "c-34" / "С 34" -> "C - 34" (rangi harfdan)
+        if field == "rating" and val:      # "c-34" / "сс 37" -> "C - 34" / "CC - 37" (rangi birinchi harfdan)
             grade, _t = rating_grade(val)
-            num = re.search(r"\d{1,3}", val)
             if not grade:
-                return {"ok": False, "error": "Reyting A–E harfi bilan boshlansin, masalan: C - 34"}
-            val = f"{grade} - {num.group(0)}" if num else grade
+                return {"ok": False, "error": "Reyting A–E harfi bilan boshlansin, masalan: C - 34 yoki CC - 37"}
+            val = rating_norm(val)
         if not q("SELECT 1 FROM companies WHERE inn=?", (inn,), one=True):
             q("INSERT INTO companies(inn,name,tg_id) VALUES(?,'',NULL)", (inn,))
         q(f"UPDATE companies SET {field}=? WHERE inn=?", (val, inn))
+        if field in ("aliases", "name"):          # korxona kalit so'zlari o'zgardi — statistika qayta hisoblansin
+            st._FIX.clear()
+            with _PERF_LOCK:
+                _PERF["t"] = 0.0
+        if field == "rating" and val:
+            q("UPDATE companies SET rating_ts=? WHERE inn=?", (now().isoformat(), inn))
+            record_rating(inn, val, "manual")
         return {"ok": True, "text": val, "grade": grade}
     tax = f.get("tax", "")
     if tax not in TAX_NAME:
@@ -3354,18 +3783,18 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         try:
             n = int(self.headers.get("Content-Length") or 0)
-            limit = (13_000_000 if self.path == "/api/shot" else 3_000_000 if self.path == "/api/frame"
+            limit = (13_000_000 if self.path == "/api/shot" else 3_000_000 if self.path in ("/api/frame", "/api/rec")
                      else 2_000_000 if self.path == "/api/activity" else 200_000)
             if n > limit:
                 return self._out(413, {"error": "too large"})
             raw = self.rfile.read(n)
         except Exception:
             return self._out(400, {"error": "bad request"})
-        if self.path == "/api/frame":   # jonli ekran kadri (agentdan, JPEG) — logga yozilmaydi
+        if self.path in ("/api/frame", "/api/rec"):   # jonli ekran / ekran yozuvi kadri (agentdan, JPEG) — logga yozilmaydi
             try:
-                code, res = st.api_frame(self.headers, raw)
+                code, res = (st.api_frame if self.path == "/api/frame" else st.api_rec)(self.headers, raw)
             except Exception:
-                log("FRAME ERROR", traceback.format_exc())
+                log("FRAME ERROR", self.path, traceback.format_exc())
                 code, res = 400, {"error": "bad request"}
             return self._out(code, res)
         if self.path in ("/api/activity", "/api/shot", "/api/wait", "/api/presence", "/api/web"):
@@ -3399,11 +3828,10 @@ class Handler(BaseHTTPRequestHandler):
             if not e:
                 return self._out(401, {"error": "bad key"})
             inn = "".join(ch for ch in str(body.get("inn") or "") if ch.isdigit())
-            g, _t = rating_grade(body.get("rating"))
-            num = re.search(r"\d{1,3}", str(body.get("rating") or ""))
-            if len(inn) in (9, 14) and g:
-                rv = f"{g} - {num.group(0)}" if num else g
+            rv = rating_norm(body.get("rating"))
+            if len(inn) in (9, 14) and rv:
                 q("UPDATE companies SET rating=?, rating_ts=? WHERE inn=?", (rv, now().isoformat(), inn))
+                record_rating(inn, rv, "soliq")
                 # Korxona hali ro'yxatda bo'lmasa ham eslab qolamiz — qo'shilganda jadvalga o'zi tushadi
                 q("INSERT OR REPLACE INTO meta(k,v) VALUES(?,?)", (f"rating:{inn}", rv))
             pr = body.get("probe")
@@ -3461,7 +3889,7 @@ class Handler(BaseHTTPRequestHandler):
         if path not in ("/", "/dashboard", "/hisobotlar", "/hisobotlar.csv", "/screentime", "/screentime/shot",
                         "/screentime/live.json", "/screentime/detail.json", "/screentime/frame",
                         "/screentime/hodim", "/screentime/wb.json", "/screentime/report.json", "/screentime/report.csv",
-                        "/screentime/log.csv"):
+                        "/screentime/log.csv", "/screentime/rec", "/screentime/rec.json", "/screentime/rec.jpg"):
             return self._out(404, "not found", "text/plain")
         # Avto-yangilanish (har daqiqa) faollik hisoblanmaydi — faqat foydalanuvchi sahifada nimadir qilgan bo'lsa.
         auto = qs.get("auto", [""])[0] == "1"
@@ -3471,6 +3899,25 @@ class Handler(BaseHTTPRequestHandler):
             return self._go("/login?e=expired" if self._cookie() else "/login")
         if path == "/screentime/live.json":
             return self._out(200, st.live_data(), extra={"Cache-Control": "no-store"})
+        if path in ("/screentime/rec", "/screentime/rec.json", "/screentime/rec.jpg"):
+            # Ekran yozuvi — faqat rahbar (owner) ko'radi: hodim ekranidagi shaxsiy ma'lumot ham bo'lishi mumkin
+            if SESS_WHO.get(self._cookie(), "owner") != "owner":
+                return self._out(403, "Ekran yozuvini faqat rahbar ko'ra oladi", "text/plain; charset=utf-8")
+            pid = qs.get("id", [""])[0]
+            day = parse_day(qs.get("d", [""])[0] or "") or now().date().isoformat()
+            if not pid.isdigit():
+                return self._out(400, "bad id", "text/plain")
+            if path == "/screentime/rec.jpg":
+                img = st.rec_frame(int(pid), day, qs.get("t", [""])[0])
+                if not img:
+                    return self._out(404, "not found", "text/plain")
+                return self._out(200, img, "image/jpeg", {"Cache-Control": "private, max-age=86400"})
+            idx = st.rec_index(int(pid), day)
+            if not idx:
+                return self._out(404, "kompyuter topilmadi", "text/plain; charset=utf-8")
+            if path.endswith(".json"):
+                return self._out(200, idx, extra={"Cache-Control": "no-store"})
+            return self._out(200, st.render_rec(int(pid), idx), "text/html; charset=utf-8")
         if path in ("/screentime/hodim", "/screentime/wb.json"):
             u = qs.get("u", [""])[0]
             day = parse_day(qs.get("d", [""])[0] or "") or now().date().isoformat()

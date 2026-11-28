@@ -7,3 +7,7 @@ bot.log
 backup/
 cloudflared/
 __pycache__/
+
+# Hodimlar ekran yozuvi kadrlari (maxfiy)
+rec/
+*.new

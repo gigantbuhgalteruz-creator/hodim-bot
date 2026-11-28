@@ -8,8 +8,9 @@ Tizim ikki qismdan iborat:
 | **Veyon** (bepul, tayyor dastur) | Hamma ekranlarni **jonli** ko'rish (kompyuter klubdagi kabi), sichqoncha/klaviaturani masofadan olish, bir tugma bilan hammasini bloklash/o'chirish | Sizning (admin) kompyuteringizdagi **Veyon Master** oynasi (faqat ofis tarmog'ida) |
 
 > ⚖️ **Muhim (qonun):** hodimlarni kuzatuv haqida **yozma ogohlantiring** — ichki tartib qoidalari yoki
-> buyruqqa "ish kompyuterlarida ish vaqti va dasturlar hisobi yuritiladi, ekran tasviri olinishi mumkin"
-> degan band qo'shib, imzo qildiring. Agent klaviaturada nima yozilganini, parollarni **o'qimaydi**.
+> buyruqqa "ish kompyuterlarida ish vaqti va dasturlar hisobi yuritiladi, **ekran tasviri doimiy yozib boriladi
+> (har 10 soniyada) va 2 kun saqlanadi**" degan band qo'shib, imzo qildiring. Agent klaviaturada nima yozilganini,
+> parollarni **o'qimaydi**. Ekran yozuvini faqat rahbar (owner) ko'radi.
 
 ---
 
@@ -52,6 +53,17 @@ Ochilgan oynada jonli holat (hozir qaysi dastur, bugungi vaqt, skrinshot) va kat
 - Buyruq 1–2 soniyada yetib boradi. Kompyuter o'chirib-yoqilsa ham blok qaytadi.
 - Telegram: `/pc` → kompyuter → ⛔ Bloklash / 🔓 Blokni ochish; "Hammasini bloklash/ochish" ham bor.
 - Ctrl+Alt+Del ni Windows o'zi boshqaradi — undan hodim faqat "Выйти/Сменить пользователя" qila oladi (ishi yopiladi).
+
+### ⏪ Ekran yozuvi (kuzatuv kamerasi kabi) — agent 1.9+
+- Agent kompyuter yoniq va ekran qulflanmagan paytda **har 10 soniyada** kichik kadr yuboradi
+  (hodim 3 daqiqadan ko'p harakatsiz bo'lsa — daqiqada bir). Bloklangan / qulflangan paytda yozilmaydi.
+- Ko'rish: hodimning **🖥 Kompyuter** oynasida jonli ekran yonidagi **⏪ Yozuv**, yoki hodim sahifasidagi **⏪ Ekran yozuvi**.
+  Vaqt chizig'ini bosib istalgan daqiqaga o'tasiz, ▶ bilan 10×–120× tezlikda o'ynatasiz; kadr ostida o'sha paytdagi
+  dastur/sayt/korxona chiqadi. Klaviatura: Probel, ← →, Shift + ← →.
+- **Faqat owner** ko'radi (boshliq sessiyasida ham yopiq). **Bugungi va kechagi** yozuv saqlanadi, eskisi har soatlik
+  tozalashda o'chadi. Serverda bo'sh joy 3 GB dan kam qolsa — yozuv to'xtaydi.
+- Sozlash (`config.json`): `REC_ENABLED` (true/false), `REC_DAYS` (2), `REC_INTERVAL` (10 soniya), `REC_MIN_FREE_GB` (3).
+- Hajmi: bitta kompyuter ~150 MB/kun, papka: `/opt/hodim-bot/rec/<kompyuter>/<sana>/`.
 
 ### Qaysi dastur "ish", qaysi "chalg'ish"
 
