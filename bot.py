@@ -143,13 +143,26 @@ CREATE TABLE IF NOT EXISTS obligations(
 """)
 for _col, _typ in (("activity", "TEXT"), ("staff", "TEXT"), ("c1", "TEXT"), ("note", "TEXT"),
                    ("regime", "TEXT"), ("perk", "TEXT"), ("rating", "TEXT"), ("rating_ts", "TEXT"),
-                   ("sort", "INTEGER"), ("active", "INTEGER DEFAULT 1"), ("aliases", "TEXT")):
+                   ("sort", "INTEGER"), ("active", "INTEGER DEFAULT 1"), ("aliases", "TEXT"),
+                   ("lead", "INTEGER")):                    # korxona qaysi Bosh buxgalter jamoasiniki (NULL — jamoasiz)
     if _col not in {r[1] for r in db.execute("PRAGMA table_info(companies)")}:
         db.execute(f"ALTER TABLE companies ADD COLUMN {_col} {_typ}")
 for _col, _typ in (("role", "TEXT DEFAULT 'hodim'"), ("pw_hash", "TEXT"),      # rollar (hodim / bosh / zam / boshliq)
                    ("lead", "INTEGER")):                                       # jamoa: qaysi bosh buxgalterga biriktirilgan
     if _col not in {r[1] for r in db.execute("PRAGMA table_info(employees)")}:
         db.execute(f"ALTER TABLE employees ADD COLUMN {_col} {_typ}")
+# Jamoalar: bir hodim bir nechta Bosh buxgalter jamoasida bo'lishi mumkin (employees.lead — eski, bittalik)
+db.execute("CREATE TABLE IF NOT EXISTS team_members(lead INTEGER, tg_id INTEGER, PRIMARY KEY(lead, tg_id))")
+if not db.execute("SELECT 1 FROM meta WHERE k='teams_v2'").fetchone():
+    # bir martalik: eski employees.lead -> team_members; korxonaga jamoa belgisi (mas'uli bosh buxgalter
+    # bo'lsa — o'sha; mas'uli bitta jamoada bo'lsa — o'sha jamoa)
+    db.execute("INSERT OR IGNORE INTO team_members(lead, tg_id) SELECT e.lead, e.tg_id FROM employees e "
+               "JOIN employees l ON l.tg_id=e.lead AND l.role='bosh' WHERE e.lead IS NOT NULL AND e.tg_id!=e.lead")
+    db.execute("UPDATE companies SET lead=tg_id WHERE lead IS NULL AND tg_id IN "
+               "(SELECT tg_id FROM employees WHERE role='bosh')")
+    db.execute("UPDATE companies SET lead=(SELECT MIN(lead) FROM team_members t WHERE t.tg_id=companies.tg_id) "
+               "WHERE lead IS NULL AND tg_id IN (SELECT tg_id FROM team_members GROUP BY tg_id HAVING COUNT(*)=1)")
+    db.execute("INSERT INTO meta(k,v) VALUES('teams_v2', datetime('now'))")
 db.commit()
 # Korxonalar ro'yxati faqat qo'lda to'ldiriladi (dashboard "+ Mijoz" yoki botda /firma).
 # active: 1 — bizning mijoz; 0 — karzinada (bildirishnoma kelmaydi, jadvalda yo'q; qaytarish yoki butunlay o'chirish mumkin).
@@ -226,39 +239,78 @@ def leads():
 
 
 def team_members(lead_id):
-    """Bosh buxgalterga biriktirilgan hodimlar (o'zi kirmaydi)."""
-    return q("SELECT * FROM employees WHERE active=1 AND lead=? AND tg_id!=? ORDER BY name", (lead_id, lead_id))
+    """Bosh buxgalter jamoasidagi hodimlar (o'zi kirmaydi). Bir hodim bir nechta jamoada bo'lishi mumkin."""
+    return q("SELECT e.* FROM employees e JOIN team_members t ON t.tg_id=e.tg_id "
+             "WHERE t.lead=? AND e.active=1 AND e.tg_id!=? ORDER BY e.name", (lead_id, lead_id))
 
 
 def team_ids(lead_id):
     return [lead_id] + [m["tg_id"] for m in team_members(lead_id)]
 
 
+def leads_of(tg_id):
+    """Hodim qaysi bosh buxgalterlar jamoasida (tg_id lar ro'yxati; o'zi bosh buxgalter bo'lsa — o'zi ham)."""
+    own = [tg_id] if role_of(tg_id) == "bosh" else []
+    return own + [r["lead"] for r in q("SELECT t.lead FROM team_members t JOIN employees l ON l.tg_id=t.lead "
+                                       "WHERE t.tg_id=? AND l.active=1 AND l.role='bosh' ORDER BY l.name", (tg_id,))]
+
+
 def lead_of(tg_id):
-    """Hodim qaysi bosh buxgalter jamoasida (yo'q bo'lsa None)."""
-    r = q("SELECT e.lead FROM employees e JOIN employees l ON l.tg_id=e.lead "
-          "WHERE e.tg_id=? AND l.active=1 AND l.role='bosh'", (tg_id,), one=True)
+    """Hodimning birinchi jamoasi (yo'q bo'lsa None)."""
+    ls = leads_of(tg_id)
+    return ls[0] if ls else None
+
+
+def set_lead(tg_id, lead_id, on=True):
+    """Hodimni bosh buxgalter jamoasiga qo'shadi (on=False — shu jamoadan chiqaradi)."""
+    if not emp(tg_id) or lead_id == tg_id or role_of(lead_id) != "bosh" or role_of(tg_id) in ("bosh", "boshliq"):
+        return False
+    if on:
+        q("INSERT OR IGNORE INTO team_members(lead, tg_id) VALUES(?,?)", (lead_id, tg_id))
+    else:
+        q("DELETE FROM team_members WHERE lead=? AND tg_id=?", (lead_id, tg_id))
+    return True
+
+
+def company_lead(inn):
+    r = q("SELECT lead FROM companies WHERE inn=?", (inn,), one=True)
     return r["lead"] if r else None
 
 
-def set_lead(tg_id, lead_id):
-    """Hodimni bosh buxgalter jamoasiga qo'shadi (lead_id=None — jamoadan chiqaradi)."""
-    if not emp(tg_id) or (lead_id is not None and (lead_id == tg_id or role_of(lead_id) != "bosh")):
-        return False
-    q("UPDATE employees SET lead=? WHERE tg_id=?", (lead_id, tg_id))
-    return True
+def team_inns(lead_id):
+    """Bosh buxgalter jamoasiga belgilangan korxonalar (INN to'plami)."""
+    return {r["inn"] for r in q("SELECT inn FROM companies WHERE lead=?", (lead_id,))}
+
+
+def set_company_lead(inn, lead_id):
+    """Korxonaga jamoa belgisi: lead_id — Bosh buxgalter (None — jamoasiz)."""
+    if lead_id is not None and role_of(lead_id) != "bosh":
+        lead_id = None
+    q("UPDATE companies SET lead=? WHERE inn=?", (lead_id, inn))
+
+
+def auto_company_lead(inn, uid):
+    """Jamoa ko'rsatilmay biriktirilganda (bot, ko'chirish): korxona jamoasi saqlanadi, agar yangi mas'ul o'sha
+    jamoada bo'lsa; aks holda — mas'ulning o'z jamoasi (bitta bo'lsa) yoki jamoasiz."""
+    if uid is None:
+        return
+    cur = company_lead(inn)
+    if cur is not None and uid in team_ids(cur):
+        return
+    ls = leads_of(uid)
+    set_company_lead(inn, ls[0] if len(ls) == 1 else None)
 
 
 def owns(tg_id, inn, day):
     """Korxona `day` kuni shu hodimniki hisoblanadimi: o'ziga biriktirilgan; ZAM/Boshliq — hammasi;
-    Bosh buxgalter — o'zi va jamoasidagi hodimlarga biriktirilganlari."""
+    Bosh buxgalter — o'z jamoasiga belgilangan (biriktirilgan) korxonalar."""
     resp = responsible(inn, day)
     if resp == tg_id:
         return True
     role = role_of(tg_id)
     if role in ("zam", "boshliq"):
         return resp is not None or bool(q(f"SELECT 1 FROM companies WHERE inn=? AND {LISTED}", (inn,), one=True))
-    return role == "bosh" and resp is not None and resp in team_ids(tg_id)
+    return role == "bosh" and resp is not None and company_lead(inn) == tg_id
 
 
 def boss_ids():
@@ -309,10 +361,11 @@ def set_role(tg_id, role):
         return False
     old = role_of(tg_id)
     q("UPDATE employees SET role=? WHERE tg_id=?", (role, tg_id))
-    if role == "bosh":                  # bosh buxgalter o'zi boshqa jamoada bo'lmaydi
-        q("UPDATE employees SET lead=NULL WHERE tg_id=?", (tg_id,))
-    elif old == "bosh":                 # bosh buxgalterlikdan olinsa — jamoasi tarqaladi
-        q("UPDATE employees SET lead=NULL WHERE lead=?", (tg_id,))
+    if role in ("bosh", "boshliq"):     # bosh buxgalter / boshliq o'zi boshqa jamoada bo'lmaydi
+        q("DELETE FROM team_members WHERE tg_id=?", (tg_id,))
+    if old == "bosh" and role != "bosh":    # bosh buxgalterlikdan olinsa — jamoasi tarqaladi
+        q("DELETE FROM team_members WHERE lead=?", (tg_id,))
+        q("UPDATE companies SET lead=NULL WHERE lead=?", (tg_id,))
     # Boshliqqa alohida dashboard login-paroli berilmaydi (rahbar kompyuteridan, umumiy login bilan ishlanadi)
     if old == "boshliq" and role != "boshliq":
         q("UPDATE employees SET pw_hash=NULL WHERE tg_id=?", (tg_id,))
@@ -328,9 +381,19 @@ def emp_name(tg_id):
     return (e["name"] + ("" if e["active"] else " (ishdan ketgan)")) if e else str(tg_id)
 
 
-def set_owner(inn, uid, day, name=""):
+def set_owner(inn, uid, day, name="", lead="auto"):
     """Korxonani `day` (YYYY-MM-DD) sanasidan boshlab `uid` ga o'tkazadi (uid=None — hech kimga).
-    Oldingi hodimning davri shu sanada yopiladi, tarix saqlanadi. True — o'zgarish bo'ldi."""
+    Oldingi hodimning davri shu sanada yopiladi, tarix saqlanadi. True — o'zgarish bo'ldi.
+    lead — korxona jamoasi (Bosh buxgalter tg_id yoki None); "auto" — auto_company_lead qoidasi."""
+    changed = _set_owner(inn, uid, day, name)
+    if lead == "auto":
+        auto_company_lead(inn, uid)
+    else:
+        set_company_lead(inn, lead)
+    return changed
+
+
+def _set_owner(inn, uid, day, name=""):
     with LOCK:
         cur = db.execute("SELECT * FROM assignments WHERE inn=? AND end IS NULL ORDER BY start DESC LIMIT 1",
                          (inn,)).fetchone()
@@ -549,7 +612,7 @@ def stats(a, b):
         viol = q("SELECT * FROM violations WHERE tg_id=? AND day>=? ORDER BY day", (e["tg_id"], ms.isoformat()))
         fine_pct = sum(v["fine_pct"] for v in viol)
         level = max([v["level"] for v in viol], default=0)
-        comps = q(f"SELECT inn,name FROM companies WHERE tg_id=? AND {LISTED} ORDER BY name", (e["tg_id"],))
+        comps = q(f"SELECT inn,name,lead FROM companies WHERE tg_id=? AND {LISTED} ORDER BY name", (e["tg_id"],))
         reps = q("SELECT COUNT(DISTINCT report_id) c FROM reports WHERE tg_id=? AND ts>=? AND ts<? "
                  f"AND inn IN (SELECT inn FROM companies WHERE {LISTED})",
                  (e["tg_id"], a.isoformat(), (b + timedelta(days=1)).isoformat()), one=True)["c"]
@@ -989,22 +1052,26 @@ def perf_base(per=None, fresh=False):
     with _PERF_LOCK:
         if not fresh and _PERF["v"] and _PERF["per"] == per and time.time() - _PERF["t"] < 300:
             return _PERF["v"]
-        work, comps = {}, {}
+        work, comps = {}, {}          # kalit: hodim tg_id; jamoa bo'yicha — (lead, tg_id)
         for r in period_matrix(per)["rows"]:
             t = r["resp"]
             if t is None or not r["c"].get("active", 1):
                 continue
-            comps.setdefault(t, []).append(r["c"])
-            w = work.setdefault(t, {"need": 0, "done": 0, "late": 0, "missing": 0, "error": 0})
+            keys = [t] + ([(r["c"]["lead"], t)] if r["c"].get("lead") is not None else [])
+            ws = []
+            for k in keys:
+                comps.setdefault(k, []).append(r["c"])
+                ws.append(work.setdefault(k, {"need": 0, "done": 0, "late": 0, "missing": 0, "error": 0}))
             for cell in r["cells"].values():
                 s = cell["st"]
                 if s not in ("ok", "late", "wait", "error", "missing", "pending"):
                     continue
-                w["need"] += 1
-                w["done"] += s in ("ok", "late")
-                w["late"] += s == "late"
-                w["missing"] += s in ("missing", "pending")
-                w["error"] += s == "error"
+                for w in ws:
+                    w["need"] += 1
+                    w["done"] += s in ("ok", "late")
+                    w["late"] += s == "late"
+                    w["missing"] += s in ("missing", "pending")
+                    w["error"] += s == "error"
         d = now().date()
         att = {s["e"]["tg_id"]: s["eff"] for s in stats(d.replace(day=1), d)}
         scr = {}
@@ -1023,15 +1090,17 @@ def _rating_num(r):
     return min(100, int(m.group(1))) if m else None
 
 
-def perf_score(ids, base):
-    """Bir hodim yoki jamoa (ids) ko'rsatkichlari va umumiy ball (0–100)."""
+def perf_score(ids, base, team=None):
+    """Bir hodim yoki jamoa (ids) ko'rsatkichlari va umumiy ball (0–100).
+    team — Bosh buxgalter tg_id: hisobot/reyting faqat shu jamoaga belgilangan korxonalardan olinadi."""
     need = done = late = missing = error = 0
     cs = []
     for t in ids:
-        w = base["work"].get(t)
+        k = t if team is None else (team, t)
+        w = base["work"].get(k)
         if w:
             need += w["need"]; done += w["done"]; late += w["late"]; missing += w["missing"]; error += w["error"]
-        cs += base["comps"].get(t, [])
+        cs += base["comps"].get(k, [])
     atts = [base["att"][t] for t in ids if base["att"].get(t) is not None]
     mine = sum(base["scr"].get(t, (0, 0))[0] for t in ids)
     active = sum(base["scr"].get(t, (0, 0))[1] for t in ids)
@@ -1055,8 +1124,9 @@ def teams_data(per=None):
     for L in leads():
         mem = team_members(L["tg_id"])
         ids = [L["tg_id"]] + [m["tg_id"] for m in mem]
-        rows = [{"e": e, "lead": i == 0, **perf_score([e["tg_id"]], base)} for i, e in enumerate([L] + list(mem))]
-        out.append({"lead": L, "members": mem, "rows": rows, **perf_score(ids, base)})
+        rows = [{"e": e, "lead": i == 0, **perf_score([e["tg_id"]], base, team=L["tg_id"])}
+                for i, e in enumerate([L] + list(mem))]
+        out.append({"lead": L, "members": mem, "rows": rows, **perf_score(ids, base, team=L["tg_id"])})
     return out, base
 
 
@@ -1388,15 +1458,16 @@ def parse_companies(text):
     return items, bad
 
 
-def assign_companies(uid, items, day=None):
-    """[(inn, nom)] ni `day` dan (standart: bugun) hodimga biriktiradi. Boshqa hodimdan olinganlar ro'yxati."""
+def assign_companies(uid, items, day=None, lead="auto"):
+    """[(inn, nom)] ni `day` dan (standart: bugun) hodimga biriktiradi. Boshqa hodimdan olinganlar ro'yxati.
+    lead — korxonalar qaysi Bosh buxgalter jamoasiga (None — jamoasiz, "auto" — o'zi aniqlanadi)."""
     day = day or now().date().isoformat()
     moved = []
     for inn, name in items:
         old = q("SELECT tg_id FROM companies WHERE inn=?", (inn,), one=True)
         if old and old["tg_id"] not in (None, uid):
             moved.append(f"{inn} ({emp_name(old['tg_id'])} dan)")
-        set_owner(inn, uid, day, name)
+        set_owner(inn, uid, day, name, lead=lead)
         activate_company(inn)
     return moved
 
@@ -1482,6 +1553,7 @@ def fire_employee(uid, to_uid, day):
     Hodimning ismi va tarixi saqlanadi."""
     moved = transfer_companies(uid, to_uid, day)
     q("UPDATE employees SET active=0 WHERE tg_id=?", (uid,))
+    q("DELETE FROM team_members WHERE tg_id=?", (uid,))
     return moved
 
 
@@ -2098,16 +2170,18 @@ def _handle_message(msg, uid, text, admin):
         eff = "—" if not s or s["eff"] is None else f"{s['eff']}%"
         extra = ""
         try:    # Bosh buxgalter — o'z jamoasi; jamoa a'zosi — jamoasining umumiy bali
-            lid = uid if e["role"] == "bosh" else lead_of(uid)
-            if lid:
+            lids = leads_of(uid)
+            if lids:
                 base = perf_base()
                 me_ = perf_score([uid], base)
                 extra = (f"📄 Hisobotlarim ({period_label(base['per'])}): {me_['done']}/{me_['need']}"
                          f" · ball: <b>{_pct(me_['score'])}</b>\n")
-                t = next((x for x in teams_data()[0] if x["lead"]["tg_id"] == lid), None)
-                if t:
-                    extra += (team_text(t, base["per"]) if e["role"] == "bosh" else
-                              f"👥 Jamoa ({esc(t['lead']['name'])}) bali: <b>{_pct(t['score'])}</b>") + "\n"
+                teams = {x["lead"]["tg_id"]: x for x in teams_data()[0]}
+                for lid in lids:
+                    t = teams.get(lid)
+                    if t:
+                        extra += (team_text(t, base["per"]) if lid == uid else
+                                  f"👥 Jamoa ({esc(t['lead']['name'])}) bali: <b>{_pct(t['score'])}</b>") + "\n"
         except Exception:
             log("ME team", traceback.format_exc())
         return tg("sendMessage", chat_id=uid, parse_mode="HTML", reply_markup=(admin_keyboard(True) if admin else emp_keyboard()),
@@ -2198,7 +2272,8 @@ FLASH = {"emp_ok": "✅ Hodim qo'shildi", "emp_nosend": "✅ Hodim qo'shildi, le
          "fire_ok": "✅ Hodim ishdan bo'shatildi — ismi va tarixi saqlandi", "same": "⚠️ Hodim o'ziga ko'chirilmaydi",
          "stale": "⚠️ Sahifa eskirgan edi — yangilandi. Iltimos, qayta kiriting.",
          "role_ok": "✅ Rol o'zgartirildi", "role_denied": "⚠️ Rolni faqat rahbar o'zgartira oladi",
-         "lead_ok": "✅ Jamoa o'zgartirildi"}
+         "lead_ok": "✅ Jamoa o'zgartirildi",
+         "not_team": "⚠️ Bu hodim tanlangan Bosh buxgalter jamoasida emas — avval jamoaga qo'shing"}
 
 
 # ---- login sessiyalari: har kirish 1 soat amal qiladi, keyin qayta login so'raladi
@@ -2402,6 +2477,12 @@ background:var(--glass);color:var(--ink);cursor:pointer;width:auto;margin:0;disp
 .role.r-boshliq{background:rgba(242,131,34,.14);border-color:rgba(242,131,34,.45);color:#c2410c}
 .role.r-bosh{background:rgba(34,197,94,.13);border-color:rgba(34,197,94,.42);color:#15803d}
 .rolef{margin:0}.rolef+.rolef{margin-top:6px}
+.tchips{display:flex;flex-wrap:wrap;gap:4px;margin-top:6px;max-width:260px}.tchip{margin:0;display:inline}
+.tchip button{font:inherit;font-size:12px;padding:3px 9px;border-radius:999px;border:1px dashed var(--line);background:none;
+color:var(--mut);cursor:pointer;width:auto;margin:0;box-shadow:none}
+.tchip button:hover{border-color:var(--mut);color:var(--ink)}
+.tchip button.on{border-style:solid;background:rgba(34,197,94,.13);border-color:rgba(34,197,94,.42);color:#15803d;font-weight:500}
+.tsel{display:grid;gap:10px;margin:6px 0 4px}.tsel .tnote{font-size:12.5px;color:var(--mut)}
 .teams{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(520px,100%),1fr));gap:14px}
 .tcard{padding:22px 24px}.thead{display:flex;justify-content:space-between;align-items:flex-start;gap:16px}
 .tscore{font-size:40px;font-weight:700;letter-spacing:-.03em;line-height:1}
@@ -2554,16 +2635,21 @@ def team_cell(e, editable):
     if e["role"] in ("bosh", "boshliq"):
         return ""
     ls = [L for L in leads() if L["tg_id"] != e["tg_id"]]
-    cur = e["lead"] if any(L["tg_id"] == e["lead"] for L in ls) else None
     if not ls:
         return ""
+    cur = set(leads_of(e["tg_id"]))
     if not editable:
-        return f'<div class="sub">Jamoa: {esc(emp_name(cur)) if cur else "—"}</div>'
-    opts = '<option value="">Jamoasiz</option>' + "".join(
-        f'<option value="{L["tg_id"]}"{" selected" if L["tg_id"] == cur else ""}>👥 {esc(L["name"])}</option>' for L in ls)
-    return (f'<form method="post" action="/dashboard/lead" class="rolef"><input type="hidden" name="csrf" value="{CSRF}">'
-            f'<input type="hidden" name="tg_id" value="{e["tg_id"]}"><select name="lead" class="role" title="Jamoa (Bosh buxgalter)" '
-            f'onchange="this.form.submit()">{opts}</select></form>')
+        names = ", ".join(esc(L["name"]) for L in ls if L["tg_id"] in cur)
+        return f'<div class="sub">Jamoa: {names or "—"}</div>'
+    # Bir nechta jamoa: har Bosh buxgalter — yoqib/o'chiriladigan tugma
+    chips = "".join(
+        f'<form method="post" action="/dashboard/lead" class="tchip"><input type="hidden" name="csrf" value="{CSRF}">'
+        f'<input type="hidden" name="tg_id" value="{e["tg_id"]}"><input type="hidden" name="lead" value="{L["tg_id"]}">'
+        f'<input type="hidden" name="on" value="{0 if L["tg_id"] in cur else 1}">'
+        f'<button class="{"on" if L["tg_id"] in cur else ""}" title="{esc(L["name"])} jamoasi — bosing: '
+        f'{"jamoadan chiqarish" if L["tg_id"] in cur else "jamoaga qo‘shish"}">👥 {esc(L["name"])}</button></form>'
+        for L in ls)
+    return f'<div class="tchips" title="Jamoa (Bosh buxgalter) — bir nechtasini tanlash mumkin">{chips}</div>'
 
 
 def teams_html():
@@ -2657,6 +2743,15 @@ def render_dashboard(flash="", is_owner=True):
                         f"<td>{resp_html}</td><td>{sender_html}</td></tr>")
 
     emp_opts = "".join(f'<option value="{e["tg_id"]}">{esc(e["name"])}</option>' for e in active_employees())
+    # Korxona biriktirish oynasi uchun: jamoalar va ularning a'zolari (bir hodim bir nechta jamoada bo'lishi mumkin)
+    lds = leads()
+    lead_name = {L["tg_id"]: L["name"] for L in lds}
+    lead_opts = "".join(f'<option value="{L["tg_id"]}">👥 {esc(L["name"])} jamoasi</option>' for L in lds)
+    asg_js = json.dumps({
+        "emps": [[str(e["tg_id"]), e["name"]] for e in active_employees()],
+        "teams": {str(L["tg_id"]): [str(x) for x in team_ids(L["tg_id"])] for L in lds},
+        "leads": {str(e["tg_id"]): [str(x) for x in leads_of(e["tg_id"])] for e in active_employees()},
+    }, ensure_ascii=False).replace("<", "\\u003c")
     now_pill = '<span class="pill g">hozirgacha</span>'
     hist_rows = "".join(
         f"<tr><td>{esc(h['cname'] or '')}<div class='sub'>{h['inn']}</div></td><td>{esc(emp_name(h['tg_id']))}</td>"
@@ -2668,7 +2763,7 @@ def render_dashboard(flash="", is_owner=True):
         e = s["e"]
         chips = "".join(
             f"""<form method="post" action="/dashboard/unassign" class="chip" onsubmit="return confirm('Olib tashlansinmi?')">
-<span>{esc(c['name'] or '(nomsiz)')}<span class="sub"> · {c['inn']}</span></span>
+<span>{esc(c['name'] or '(nomsiz)')}<span class="sub"> · {c['inn']}</span>{f'<span class="sub" title="Jamoa">  · 👥 {esc(lead_name[c["lead"]])}</span>' if c['lead'] in lead_name else ''}</span>
 <input type="hidden" name="inn" value="{esc(c['inn'])}"><input type="hidden" name="csrf" value="{CSRF}">
 <button title="Olib tashlash" aria-label="Olib tashlash">×</button></form>""" for c in s["comps"])
         team.append(f"""<div class="member glass"><div class="mhead"><div><b>{esc(e['name'])}</b>
@@ -2785,7 +2880,9 @@ padding:10px 13px;border-radius:12px;border:1px solid var(--line);background:var
 <p class="sub">Jamoa bali = hisobotlar {PERF_W['rep']}% (mas'ul korxonalarning davr hisobotlaridan topshirilgani, kechi — yarim ball)
 + davomat {PERF_W['att']}% + korxona ishiga vaqt {PERF_W['work']}% (kompyuterdagi faol vaqtning o'z/jamoa korxonalariga ulushi)
 + reyting {PERF_W['rating']}% (soliq.uz reytingi o'rtachasi). Ma'lumoti yo'q qismi hisobga olinmaydi. Har 5 daqiqada yangilanadi.</p>
-<h2>Hodimlar va korxonalar</h2>
+<p class="sub">Bir hodim bir nechta jamoada bo‘lishi mumkin. Korxona qaysi jamoa orqali biriktirilgan bo‘lsa, o‘sha jamoa baliga kiradi; jamoasiz biriktirilgani — hech qaysi jamoaga kirmaydi.</p>
+<h2 style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">Hodimlar va korxonalar
+<button class="btn sm" data-asg data-id="" data-name="" style="margin-left:auto">{ic("plus")}Korxona biriktirish</button></h2>
 <div class="team">{''.join(team) or '<div class="member glass mut">Hodimlar yo‘q</div>'}</div>
 <h2>Oxirgi hisobotlar</h2><div class="card glass"><table><tr><th>Vaqt</th><th>Firma</th><th>Hisobot</th><th>Holat</th>
 <th>Mas'ul (o‘sha sanada)</th><th>Yuborgan</th></tr>
@@ -2805,10 +2902,13 @@ padding:10px 13px;border-radius:12px;border:1px solid var(--line);background:var
 <div class="actions"><button type="button" class="btn ghost" data-close>Bekor</button><button class="btn">Qo‘shish</button></div>
 </form></dialog>
 <dialog id="dAsg"><form method="post" action="/dashboard/assign">
-<h3>Korxona qo‘shish · <span class="who"></span></h3>
+<h3>Korxona biriktirish</h3>
+<div class="tsel"><label>Jamoa (Bosh buxgalter)<select name="lead" id="asgLead"><option value="">Jamoasiz — to‘g‘ridan-to‘g‘ri hodimga</option>{lead_opts}</select></label>
+<label>Hodim<select name="tg_id" id="asgEmp" required></select></label>
+<div class="tnote" id="asgNote"></div></div>
 <label>Har qatorga bittadan: INN Firma nomi<textarea name="companies" required
 placeholder="309497371 UNI-TAX CONSULT MCHJ&#10;305123456 BEKOBOD ASFALT BETON MCHJ"></textarea></label>
-<input type="hidden" name="tg_id"><input type="hidden" name="csrf" value="{CSRF}">
+<input type="hidden" name="csrf" value="{CSRF}">
 <div class="actions"><button type="button" class="btn ghost" data-close>Bekor</button><button class="btn">Biriktirish</button></div>
 </form></dialog>
 <dialog id="dTr"><form method="post" action="/dashboard/transfer">
@@ -2841,9 +2941,19 @@ d.querySelector('[name=uid]').value=b.dataset.id;d.querySelector('.who').textCon
 [...d.querySelectorAll('[name=to] option')].forEach(o=>o.disabled=(o.value===b.dataset.id));d.showModal();}});
 document.querySelector('#dFire form').onsubmit=()=>confirm('Rostdan ham ishdan bo‘shatilsinmi?');
 document.getElementById('addEmp').onclick=()=>document.getElementById('dEmp').showModal();
-document.querySelectorAll('[data-asg]').forEach(b=>b.onclick=()=>{{const d=document.getElementById('dAsg');
-d.querySelector('[name=tg_id]').value=b.dataset.id;d.querySelector('.who').textContent=b.dataset.name;d.showModal();
-d.querySelector('textarea').focus();}});
+// Korxona biriktirish: avval jamoa (Bosh buxgalter), so'ng shu jamoa a'zolari; "Jamoasiz" — hamma hodimlar
+const ASG={asg_js};
+function asgFill(keep){{const L=document.getElementById('asgLead').value,sel=document.getElementById('asgEmp'),prev=keep||sel.value;
+ const ids=L?ASG.teams[L]:ASG.emps.map(x=>x[0]);sel.innerHTML='';
+ ids.forEach(id=>{{const e=ASG.emps.find(x=>x[0]===id);if(!e)return;const o=document.createElement('option');o.value=id;
+  o.textContent=(L&&id===L?'🎖 ':'')+e[1]+(L&&id===L?' (Bosh buxgalter)':'');sel.appendChild(o)}});
+ if(ids.includes(prev))sel.value=prev;
+ document.getElementById('asgNote').textContent=L?(ids.length>1?'':'Bu jamoada hali a’zo yo‘q — Hodimlar jadvalidagi 👥 tugmalari bilan qo‘shing.')
+  :'Korxona hech qaysi jamoa baliga kirmaydi.'}}
+document.getElementById('asgLead').onchange=()=>asgFill();
+document.querySelectorAll('[data-asg]').forEach(b=>b.onclick=()=>{{const d=document.getElementById('dAsg'),id=b.dataset.id;
+ const ls=id?(ASG.leads[id]||[]):[];document.getElementById('asgLead').value=ls.length?ls[0]:'';
+ asgFill(id);d.showModal();d.querySelector('textarea').focus();}});
 document.querySelectorAll('[data-close]').forEach(b=>b.onclick=()=>b.closest('dialog').close());
 // Har daqiqa yangilanadi. Oxirgi daqiqada sichqoncha/klaviatura/aylantirish bo'lsa — faol (sessiya uzayadi).
 let lastAct=/[?&]auto=1/.test(location.search)?0:Date.now();
@@ -2968,6 +3078,9 @@ border:1px solid var(--edge);box-shadow:0 20px 60px -15px var(--shadow)}
 background:var(--n-bg);color:var(--ink);text-align:left}
 #menu button:hover,#pick button:hover{background:var(--acc-soft);color:var(--acc)}
 #pick button.on{background:var(--acc);color:#fff}
+#pick .pgh{font-size:11.5px;font-weight:600;color:var(--mut);margin:8px 2px 0;padding-top:6px;border-top:1px solid var(--line)}
+#pick .pgh:first-child{border-top:0;margin-top:0;padding-top:0}#pick .opts{max-height:380px}
+#menu form[hidden],#pick form[hidden]{display:none}
 #menu .ok{color:var(--g)}#menu .late{color:var(--o)}#menu .error{color:var(--r)}#menu .wait{color:var(--y)}
 td.pk{cursor:pointer;min-width:96px;font-size:13px;white-space:normal}
 td.pk::after{content:" ▾";color:var(--mut);font-size:10px}
@@ -3114,9 +3227,10 @@ async function setPick(v){const td=pcur;if(!td)return;const f=td.dataset.f;
 $$('td.pk').forEach(td=>td.onclick=e=>{e.stopPropagation();if(pcur===td)return closePick();closePick();closeMenu();pcur=td;td.classList.add('sel');
  const f=td.dataset.f;pick.querySelector('.mh').textContent=td.closest('tr').dataset.name+' · '+PT[f];
  const box=pick.querySelector('.opts');box.innerHTML='';
- (PICKS[f]||[]).forEach(([v,t])=>{const b=document.createElement('button');b.type='button';b.textContent=t;
+ (PICKS[f]||[]).forEach(([v,t])=>{if(v===null){const h=document.createElement('div');h.className='pgh';h.textContent=t;box.appendChild(h);return}
+  const b=document.createElement('button');b.type='button';b.textContent=t;
   if(v===td.dataset.v&&v!=='')b.className='on';b.onclick=()=>setPick(v);box.appendChild(b)});
- if(f==='staff'&&PICKS.staff.length<2){const s=document.createElement('div');s.className='sub';
+ if(f==='staff'&&PICKS.staff.filter(x=>x[0]).length<2){const s=document.createElement('div');s.className='sub';
   s.textContent='Botda hali hodim yo‘q — avval hodim qo‘shing.';box.prepend(s)}
  const fm=pick.querySelector('form');fm.hidden=f==='staff';fm.querySelector('input').value='';pick.hidden=false;
  const r=td.getBoundingClientRect(),w=pick.offsetWidth,h=pick.offsetHeight;
@@ -3288,8 +3402,10 @@ def render_matrix(nav, flash=""):
         if m["other"]:
             oth = "; ".join(f'{f["tax"][2:]} — {WORDS.get(f["status"], f["status"])}' for f in r["others"])
             tds.append(f'<td class="ro" style="white-space:normal;min-width:180px">{esc(oth)}</td>')
-        staff_td = (f'<td class="pk" data-f="staff" data-v="{r["resp"] or ""}" title="Bosing — hodimni tanlang">'
-                    f'{esc(r["staff"])}</td>')
+        ld = c.get("lead")
+        sv = f'{r["resp"]}@{"" if ld is None else ld}' if r["resp"] else ""
+        staff_td = (f'<td class="pk" data-f="staff" data-v="{sv}" title="Bosing — hodimni tanlang">{esc(r["staff"])}'
+                    + (f'<div class="sub">👥 {esc(emp_name(ld))}</div>' if ld is not None and r["resp"] else "") + '</td>')
         rp_td = (f'<td class="pk" data-f="regime" data-v="{esc(c.get("regime") or "")}">{esc(c.get("regime") or "")}</td>'
                  f'<td class="ro per">{period_label(per)}</td>')
         g, gtxt = rating_grade(c.get("rating"))
@@ -3346,7 +3462,15 @@ def render_matrix(nav, flash=""):
     hidden = f'<input type="hidden" name="p" value="{nav}"><input type="hidden" name="csrf" value="{CSRF}">'
     due = period_due(per)
     emps = [(str(e_["tg_id"]), e_["name"]) for e_ in active_employees()]
-    picks = {"staff": emps + [("", "— biriktirilmagan")],
+    # Hodim tanlash: avval har jamoa (Bosh buxgalter + a'zolari), so'ng jamoasiz — hamma hodimlar. Qiymat: "uid@lead"
+    staff_pick = []
+    for L in leads():
+        staff_pick.append((None, f"👥 {L['name']} jamoasi"))
+        staff_pick += [(f"{m}@{L['tg_id']}", ("🎖 " if m == L["tg_id"] else "") + emp_name(m)) for m in team_ids(L["tg_id"])]
+    if staff_pick:
+        staff_pick.append((None, "Jamoasiz"))
+    staff_pick += [(f"{u}@", n) for u, n in emps]
+    picks = {"staff": staff_pick + [("", "— biriktirilmagan")],
              "regime": [(x, x) for x in REGIMES] + [("", "— bo‘sh")],
              "perk": [(x, x) for x in PERKS] + [("", "— bo‘sh")]}
     picks_js = json.dumps(picks).replace("<", "\\u003c")
@@ -3493,11 +3617,20 @@ def matrix_api(f):
             db.commit()
         return {"ok": True, "moved": moved}
     if kind == "staff":
-        # Hodim tanlandi: shu davr boshidan (oyning 1-kunidan) korxona unga biriktiriladi, tarix saqlanadi.
-        uid = int(v) if v.isdigit() else None
+        # Hodim tanlandi ("uid@lead"; lead bo'sh — jamoasiz): shu davr boshidan (oyning 1-kunidan) korxona unga
+        # biriktiriladi, tarix saqlanadi; korxona tanlangan jamoaga belgilanadi.
+        u, _, ld = v.partition("@")
+        uid = int(u) if u.isdigit() else None
         if uid is not None and not emp(uid):
             return {"ok": False, "error": "Bunday faol hodim yo'q — sahifani yangilang"}
-        set_owner(inn, uid, per + "-01")
+        lead = "auto"
+        if uid is not None and "@" in v:
+            lead = int(ld) if ld.isdigit() and role_of(int(ld)) == "bosh" else None
+            if lead is not None and uid not in team_ids(lead):
+                return {"ok": False, "error": "Bu hodim shu jamoada emas — sahifani yangilang"}
+        set_owner(inn, uid, per + "-01", lead=lead)
+        with _PERF_LOCK:
+            _PERF["t"] = 0.0
         q("UPDATE companies SET staff=? WHERE inn=?", (emp(uid)["name"] if uid else "", inn))
         return {"ok": True, "reload": True}
     if kind == "co":
@@ -3748,14 +3881,14 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/dashboard/lead":
             if SESS_WHO.get(self._cookie(), "owner") != "owner":
                 return self._redirect("role_denied")          # jamoani faqat rahbar o'zgartiradi
-            uid, lid = f.get("tg_id", ""), f.get("lead", "")
-            if not uid.isdigit() or (lid and not lid.isdigit()) or not set_lead(int(uid), int(lid) if lid else None):
+            uid, lid, on = f.get("tg_id", ""), f.get("lead", ""), f.get("on", "1") != "0"
+            if not uid.isdigit() or not lid.isdigit() or not set_lead(int(uid), int(lid), on):
                 return self._redirect("no_emp")
-            log("LEAD", uid, lid)
+            log("LEAD", uid, lid, on)
             with _PERF_LOCK:
                 _PERF["t"] = 0.0                               # jamoa o'zgardi — ballni qayta hisoblaymiz
-            send(OWNER, f"👥 {esc(emp_name(int(uid)))} — " + (f"<b>{esc(emp_name(int(lid)))}</b> jamoasiga qo'shildi"
-                                                               if lid else "jamoadan chiqarildi"), owner_only=True)
+            send(OWNER, f"👥 {esc(emp_name(int(uid)))} — <b>{esc(emp_name(int(lid)))}</b> "
+                        + ("jamoasiga qo'shildi" if on else "jamoasidan chiqarildi"), owner_only=True)
             return self._redirect("lead_ok")
         if path == "/dashboard/add_employee":
             uid, name = f.get("tg_id", "").strip(), " ".join(f.get("name", "").split())[:80]
@@ -3768,13 +3901,18 @@ class Handler(BaseHTTPRequestHandler):
                     [[("➕ Korxona biriktirish", f"asg:{uid}")]])
             return self._redirect("emp_ok" if delivered else "emp_nosend")
         if path == "/dashboard/assign":
-            uid = f.get("tg_id", "")
+            uid, lid = f.get("tg_id", ""), f.get("lead", "")
             if not uid.isdigit() or not emp(int(uid)):
                 return self._redirect("no_emp")
+            lead = int(lid) if lid.isdigit() and role_of(int(lid)) == "bosh" else None
+            if lead is not None and int(uid) not in team_ids(lead):
+                return self._redirect("not_team")
             items, _bad = parse_companies(f.get("companies", ""))
             if not items:
                 return self._redirect("bad_inn")
-            assign_companies(int(uid), items)
+            assign_companies(int(uid), items, lead=lead)
+            with _PERF_LOCK:
+                _PERF["t"] = 0.0
             return self._redirect("asg_ok")
         if path == "/dashboard/unassign":
             inn = "".join(ch for ch in f.get("inn", "") if ch.isdigit())

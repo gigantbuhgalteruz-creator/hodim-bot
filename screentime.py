@@ -520,14 +520,16 @@ def mine_checker(tg_id, day):
     """inn -> korxona shu hodimniki hisoblanadimi (`day` kuni). Hodim — o'ziga biriktirilgan;
     Bosh buxgalter — o'zi va jamoasidagi hodimlarga biriktirilgan; ZAM/Boshliq — ro'yxatdagi hammasi."""
     role = role_of(tg_id)
-    team = set(team_ids(tg_id)) if role == "bosh" else {tg_id}
+    # Bosh buxgalter: o'ziga biriktirilgan + o'z jamoasiga belgilangan (mas'uli bor) korxonalar
+    tinns = {r["inn"] for r in q("SELECT inn FROM companies WHERE lead=?", (tg_id,))} if role == "bosh" else set()
     listed = {r["inn"] for r in q("SELECT inn FROM companies WHERE COALESCE(active,1)=1")} \
         if role in ("zam", "boshliq") else set()
     cache = {}
 
     def assigned(inn):
         if inn not in cache:
-            cache[inn] = responsible(inn, day) in team
+            resp = responsible(inn, day)
+            cache[inn] = resp == tg_id or (resp is not None and inn in tinns)
         return cache[inn]
 
     def is_mine(inn):
