@@ -867,15 +867,35 @@ def name_key(s):
     return re.sub(r"[^a-z]", "", "".join(_CYR.get(ch, ch) for ch in w).replace("'", ""))
 
 
-def make_cell(f, o, month, hist, overdue):
+# Soliq turining o'z chastotasi (korxona sozlamasidan ustun): foyda — chorakda (3,6,9,12-oy);
+# balans, moliyaviy natija, statistika — yilda bir marta (12-oy davri). Qolganlari — korxona majburiyatiga qarab.
+TAX_FREQ = {"prib": "q", "balans": "y", "finres": "y", "stat": "y"}
+
+
+def tax_due_month(tax, month, freq):
+    """Shu oy (davr) uchun bu hisobot topshiriladimi."""
+    f = TAX_FREQ.get(tax, freq)
+    return month == 12 if f == "y" else (month % 3 == 0 if f == "q" else True)
+
+
+def tax_due(per, tax=None):
+    """Davr hisobotining topshirish muddati: yillik (12-oy) foyda/balans/mol-mulk — keyingi yilning 1-marti."""
+    if per[5:7] == "12" and tax in ("prib", "balans", "finres", "stat", "imush"):
+        return date(int(per[:4]) + 1, 3, 1)
+    return period_due(per)
+
+
+def make_cell(f, o, month, hist, overdue, tax=None):
     """filings qatori (f) va majburiyat (o) -> jadval katagi."""
-    expected = not hist and bool(o and o["required"] and (o["freq"] != "q" or month % 3 == 0))
+    due_now = tax_due_month(tax, month, o["freq"] if o else "m")
+    expected = not hist and bool(o and o["required"] and due_now)
     if f:
         return {"st": f["status"], "src": f["source"], "rid": f["report_id"], "ts": f["ts"],
                 "detail": f["detail"], "expected": expected}
     if expected:
         return {"st": "missing" if overdue else "pending", "expected": True}
-    return {"st": None, "expected": False, "never": bool(o and not o["required"])}
+    return {"st": None, "expected": False, "never": bool(o and not o["required"]),
+            "off": bool(o and o["required"] and not due_now), "freq": TAX_FREQ.get(tax, o["freq"] if o else "m")}
 
 
 def is_hist(per):
@@ -886,7 +906,7 @@ def is_hist(per):
 def one_cell(inn, per, tax):
     return make_cell(q("SELECT * FROM filings WHERE inn=? AND period=? AND tax=?", (inn, per, tax), one=True),
                      q("SELECT * FROM obligations WHERE inn=? AND tax=?", (inn, tax), one=True),
-                     int(per[5:7]), is_hist(per), now().date() > period_due(per))
+                     int(per[5:7]), is_hist(per), now().date() > tax_due(per, tax), tax)
 
 
 def period_matrix(per):
@@ -920,7 +940,8 @@ def period_matrix(per):
         cells = {}
         for code, _n, _x in TAXES:
             f = fil.get(inn, {}).get(code)
-            cells[code] = make_cell(f, obl.get(inn, {}).get(code), month, hist, overdue)
+            cells[code] = make_cell(f, obl.get(inn, {}).get(code), month, hist,
+                                    now().date() > tax_due(per, code), code)
             if f or cells[code]["expected"]:
                 used.add(code)
         others = [f for t, f in fil.get(inn, {}).items() if t.startswith("x:")]
@@ -3158,6 +3179,10 @@ def cell_view(cell):
         info = "Hali topshirilmagan, muddat o'tmagan."
     if st == "note":
         text = cell.get("detail") or ""
+    elif st is None and cell.get("off"):      # topshiradi, lekin bu oyda emas (choraklik / yillik)
+        text = "—"
+        info = ("Yillik hisobot — faqat dekabr davri uchun (yilda bir marta) topshiriladi"
+                if cell.get("freq") == "y" else "Choraklik hisobot — faqat mart, iyun, sentyabr, dekabr davrlari uchun")
     elif st is None:
         text = "йук" if cell.get("never") else ""
         info = "Belgilangan: bu korxona bu soliqni topshirmaydi" if cell.get("never") else ""
